@@ -1,0 +1,7 @@
+Cargo.lock
+target
+.venv/
+benchmark_results_*.csv
+research_blake3_toolkit/artifacts/benchmark_results_*.csv
+research_blake3_toolkit/artifacts/benchmark_dataset/
+research_blake3_toolkit/artifacts/benchmark_dataset_small/
