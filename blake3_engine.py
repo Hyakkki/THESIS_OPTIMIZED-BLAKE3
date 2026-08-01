@@ -1,20 +1,30 @@
 import csv
 import hashlib
-import mmap
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
+import cpuinfo
 import psutil
 from blake3 import blake3
 
 
-BASELINE_CHUNK_SIZE = 1024 * 1024  # 1 MiB
-MMAP_MIN_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
+BASELINE_CHUNK_SIZE = 1024 * 1024  # 1 MiB – fixed for the baseline mode
+MMAP_THRESHOLD = 64 * 1024 * 1024  # 64 MiB – switch to mmap above this size
+PARALLEL_MIN_SIZE = 1 * 1024 * 1024  # 1 MiB – enable max_threads above this
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 @dataclass
 class HashMetrics:
@@ -25,6 +35,8 @@ class HashMetrics:
     throughput_mb_s: float
     cpu_percent: float
     memory_mb: float
+    simd_tier: str = ""
+    threads_used: int = 1
 
 
 @dataclass
@@ -40,7 +52,64 @@ class BenchmarkRow:
     cpu_percent: float
     memory_mb: float
     digest: str
+    simd_tier: str = ""
+    threads_used: int = 1
 
+
+# ---------------------------------------------------------------------------
+# Stage 3 – SIMD-aware Execution: Detect CPU capabilities
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def detect_simd_capabilities() -> dict[str, bool | str]:
+    """Detect which SIMD instruction sets the CPU supports.
+
+    Returns a dict with boolean flags for each tier and a 'best' key
+    indicating the highest tier available for BLAKE3.
+    """
+    try:
+        info = cpuinfo.get_cpu_info()
+        flags = set(info.get("flags", []))
+    except Exception:
+        flags = set()
+
+    has_sse2 = "sse2" in flags
+    has_sse41 = "sse4_1" in flags or "sse4.1" in flags
+    has_avx2 = "avx2" in flags
+    has_avx512 = "avx512f" in flags and "avx512vl" in flags
+
+    # Determine best tier available for BLAKE3
+    if has_avx512:
+        best = "AVX-512"
+    elif has_avx2:
+        best = "AVX2"
+    elif has_sse41:
+        best = "SSE4.1"
+    elif has_sse2:
+        best = "SSE2"
+    else:
+        best = "Portable"
+
+    return {
+        "sse2": has_sse2,
+        "sse41": has_sse41,
+        "avx2": has_avx2,
+        "avx512": has_avx512,
+        "best": best,
+    }
+
+
+def get_simd_summary() -> str:
+    """Return a human-readable string describing the active SIMD tier."""
+    caps = detect_simd_capabilities()
+    supported = [name.upper() for name in ("sse2", "sse41", "avx2", "avx512") if caps.get(name)]
+    detail = ", ".join(supported) if supported else "none"
+    return f"{caps['best']} ({detail})"
+
+
+# ---------------------------------------------------------------------------
+# File type classification
+# ---------------------------------------------------------------------------
 
 def classify_file_type(file_path: str) -> str:
     suffix = Path(file_path).suffix.lower()
@@ -66,13 +135,29 @@ def classify_file_type(file_path: str) -> str:
     return "other"
 
 
-def adaptive_chunk_size(file_size: int) -> int:
-    if file_size < 4 * 1024 * 1024:
-        return 256 * 1024  # 256 KiB
-    if file_size < 128 * 1024 * 1024:
-        return 1024 * 1024  # 1 MiB
-    return 8 * 1024 * 1024  # 8 MiB
+# ---------------------------------------------------------------------------
+# Stage 1 – Adaptive Chunk & Buffer Handling
+# ---------------------------------------------------------------------------
 
+def adaptive_chunk_size(file_size: int) -> int:
+    """Select chunk size based on file size to balance I/O and memory."""
+    if file_size < 4 * 1024 * 1024:
+        return 256 * 1024  # 256 KiB for small files
+    if file_size < 128 * 1024 * 1024:
+        return 1024 * 1024  # 1 MiB for medium files
+    return 8 * 1024 * 1024  # 8 MiB for large files
+
+
+def adaptive_buffer(chunk_size: int) -> tuple[bytearray, memoryview]:
+    """Dynamically allocate a reusable buffer matching the adaptive chunk size."""
+    buffer = bytearray(chunk_size)
+    view = memoryview(buffer)
+    return buffer, view
+
+
+# ---------------------------------------------------------------------------
+# Resource monitoring helpers
+# ---------------------------------------------------------------------------
 
 def _compute_cpu_percent(start_cpu_total: float, elapsed_s: float) -> float:
     if elapsed_s <= 0:
@@ -90,7 +175,17 @@ def _memory_mb() -> float:
     return process.memory_info().rss / (1024 * 1024)
 
 
-def _hash_stream(file_path: str, chunk_size: int) -> str:
+def _available_threads() -> int:
+    """Return the number of logical CPU cores available for multithreading."""
+    return max(1, os.cpu_count() or 1)
+
+
+# ---------------------------------------------------------------------------
+# Hashing backends – Baseline (non-optimized)
+# ---------------------------------------------------------------------------
+
+def _hash_stream_baseline(file_path: str, chunk_size: int) -> str:
+    """Baseline: fixed chunk reads, single-threaded, no buffer reuse."""
     hasher = blake3()
     with open(file_path, "rb") as f:
         while True:
@@ -101,10 +196,20 @@ def _hash_stream(file_path: str, chunk_size: int) -> str:
     return hasher.hexdigest()
 
 
-def _hash_stream_reuse_buffer(file_path: str, chunk_size: int) -> str:
-    hasher = blake3()
-    buffer = bytearray(chunk_size)
-    view = memoryview(buffer)
+# ---------------------------------------------------------------------------
+# Hashing backends – Optimized
+# ---------------------------------------------------------------------------
+
+def _hash_stream_optimized(file_path: str, chunk_size: int) -> str:
+    """Optimized stream: adaptive buffer reuse + multithreaded BLAKE3.
+
+    Stages applied:
+        1. Adaptive Buffer Handling  – readinto() with pre-allocated buffer
+        2. Multithreaded Processing  – blake3(max_threads=AUTO)
+        3. SIMD-aware Execution      – automatic inside blake3
+    """
+    hasher = blake3(max_threads=blake3.AUTO)
+    buffer, view = adaptive_buffer(chunk_size)
 
     with open(file_path, "rb") as f:
         while True:
@@ -116,25 +221,31 @@ def _hash_stream_reuse_buffer(file_path: str, chunk_size: int) -> str:
     return hasher.hexdigest()
 
 
-def _hash_mmap(file_path: str, chunk_size: int) -> str:
-    hasher = blake3()
-    file_size = os.path.getsize(file_path)
-    with open(file_path, "rb") as f:
-        with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
-            offset = 0
-            while offset < file_size:
-                hasher.update(mm[offset : offset + chunk_size])
-                offset += chunk_size
+def _hash_mmap_optimized(file_path: str) -> str:
+    """Optimized mmap: blake3 built-in memory-mapped I/O + multithreading.
+
+    Stages applied:
+        1. Adaptive Buffer Handling  – memory-mapped file (OS manages pages)
+        2. Multithreaded Processing  – blake3(max_threads=AUTO)
+        3. SIMD-aware Execution      – automatic inside blake3
+    """
+    hasher = blake3(max_threads=blake3.AUTO)
+    hasher.update_mmap(file_path)
     return hasher.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# Public hashing functions
+# ---------------------------------------------------------------------------
+
 def hash_file_baseline(file_path: str) -> HashMetrics:
+    """Baseline BLAKE3: fixed 1 MiB chunks, single-threaded, no optimizations."""
     file_size = os.path.getsize(file_path)
     process = psutil.Process(os.getpid())
     start_cpu = process.cpu_times().user + process.cpu_times().system
     start = time.perf_counter()
 
-    digest = _hash_stream(file_path, BASELINE_CHUNK_SIZE)
+    digest = _hash_stream_baseline(file_path, BASELINE_CHUNK_SIZE)
 
     elapsed = time.perf_counter() - start
     throughput = (file_size / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
@@ -146,20 +257,56 @@ def hash_file_baseline(file_path: str) -> HashMetrics:
         throughput_mb_s=throughput,
         cpu_percent=_compute_cpu_percent(start_cpu, elapsed),
         memory_mb=_memory_mb(),
+        simd_tier="N/A",
+        threads_used=1,
     )
 
 
 def hash_file_optimized(file_path: str) -> HashMetrics:
+    """Optimized BLAKE3 – four-stage pipeline matching the thesis architecture.
+
+    Pipeline:
+        Stage 1 – Adaptive Chunk & Buffer Handling
+                   Selects chunk size based on file size; chooses mmap for
+                   large files or buffer-reuse streaming for smaller files.
+
+        Stage 2 – Multithreaded Parallel Processing
+                   blake3 hasher is created with max_threads=AUTO so that
+                   BLAKE3's internal Merkle tree hashing distributes work
+                   across all available CPU cores.
+
+        Stage 3 – SIMD-aware Execution
+                   The blake3 library auto-detects the highest SIMD tier
+                   (SSE2 → SSE4.1 → AVX2 → AVX-512) and uses it.
+                   We detect and report the active tier.
+
+        Stage 4 – BLAKE3 Hashing Engine
+                   Data flows through BLAKE3's binary Merkle tree.
+                   Chunks are hashed at leaf nodes and combined
+                   hierarchically to produce a single root digest.
+    """
     file_size = os.path.getsize(file_path)
-    chunk_size = adaptive_chunk_size(file_size)
     process = psutil.Process(os.getpid())
     start_cpu = process.cpu_times().user + process.cpu_times().system
+
+    # --- Stage 1: Adaptive Chunk & Buffer Handling ---
+    chunk_size = adaptive_chunk_size(file_size)
+    use_mmap = file_size >= MMAP_THRESHOLD
+
+    # --- Stage 3: SIMD-aware Execution (detection) ---
+    simd_caps = detect_simd_capabilities()
+    simd_tier = simd_caps["best"]
+    threads = _available_threads()
+
+    # --- Stage 2 & 4: Multithreaded Processing → BLAKE3 Engine ---
     start = time.perf_counter()
 
-    if file_size >= MMAP_MIN_SIZE:
-        digest = _hash_mmap(file_path, chunk_size)
+    if use_mmap:
+        # Large files: memory-mapped I/O + multithreaded BLAKE3
+        digest = _hash_mmap_optimized(file_path)
     else:
-        digest = _hash_stream_reuse_buffer(file_path, chunk_size)
+        # Smaller files: adaptive buffer reuse + multithreaded BLAKE3
+        digest = _hash_stream_optimized(file_path, chunk_size)
 
     elapsed = time.perf_counter() - start
     throughput = (file_size / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
@@ -171,10 +318,13 @@ def hash_file_optimized(file_path: str) -> HashMetrics:
         throughput_mb_s=throughput,
         cpu_percent=_compute_cpu_percent(start_cpu, elapsed),
         memory_mb=_memory_mb(),
+        simd_tier=simd_tier,
+        threads_used=threads,
     )
 
 
 def hash_file_blake2(file_path: str) -> HashMetrics:
+    """BLAKE2b baseline for comparison with the BLAKE algorithm family."""
     file_size = os.path.getsize(file_path)
     chunk_size = adaptive_chunk_size(file_size)
     process = psutil.Process(os.getpid())
@@ -199,8 +349,14 @@ def hash_file_blake2(file_path: str) -> HashMetrics:
         throughput_mb_s=throughput,
         cpu_percent=_compute_cpu_percent(start_cpu, elapsed),
         memory_mb=_memory_mb(),
+        simd_tier="N/A",
+        threads_used=1,
     )
 
+
+# ---------------------------------------------------------------------------
+# File gathering
+# ---------------------------------------------------------------------------
 
 def gather_files(dataset_path: str, recursive: bool = True) -> list[str]:
     root = Path(dataset_path)
@@ -212,6 +368,10 @@ def gather_files(dataset_path: str, recursive: bool = True) -> list[str]:
     files.sort()
     return files
 
+
+# ---------------------------------------------------------------------------
+# Benchmarking
+# ---------------------------------------------------------------------------
 
 def benchmark_files(
     file_paths: Iterable[str],
@@ -244,10 +404,18 @@ def benchmark_files(
                         cpu_percent=metrics.cpu_percent,
                         memory_mb=metrics.memory_mb,
                         digest=metrics.digest,
+                        simd_tier=metrics.simd_tier,
+                        threads_used=metrics.threads_used,
                     )
                 )
 
     return rows
+
+
+def _benchmark_single_file(args: tuple[str, int, bool]) -> list[BenchmarkRow]:
+    """Worker function for ProcessPoolExecutor – hashes a single file."""
+    file_path, repeats, include_blake2 = args
+    return benchmark_files([file_path], repeats=repeats, include_blake2=include_blake2)
 
 
 def benchmark_files_parallel(
@@ -256,23 +424,31 @@ def benchmark_files_parallel(
     workers: int | None = None,
     include_blake2: bool = False,
 ) -> list[BenchmarkRow]:
-    # Parallel execution is applied across files, not within BLAKE3 internals.
+    """Parallel benchmark using ProcessPoolExecutor across files.
+
+    Each file is dispatched to a separate process, avoiding the GIL
+    and matching the thesis requirement for ProcessPoolExecutor.
+    Within each process, blake3(max_threads=AUTO) provides additional
+    chunk-level parallelism.
+    """
     file_list = list(file_paths)
     if workers is None:
         workers = min(32, max(2, (os.cpu_count() or 2)))
 
     rows: list[BenchmarkRow] = []
+    task_args = [(path, repeats, include_blake2) for path in file_list]
 
-    def run_single(file_path: str) -> list[BenchmarkRow]:
-        return benchmark_files([file_path], repeats=repeats, include_blake2=include_blake2)
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(run_single, path) for path in file_list]
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_benchmark_single_file, args) for args in task_args]
         for future in as_completed(futures):
             rows.extend(future.result())
 
     return rows
 
+
+# ---------------------------------------------------------------------------
+# Hash consistency verification (Stage 5)
+# ---------------------------------------------------------------------------
 
 def validate_consistency(rows: Iterable[BenchmarkRow]) -> list[str]:
     issues: list[str] = []
@@ -301,6 +477,10 @@ def validate_consistency(rows: Iterable[BenchmarkRow]) -> list[str]:
     return issues
 
 
+# ---------------------------------------------------------------------------
+# CSV output
+# ---------------------------------------------------------------------------
+
 def write_benchmark_csv(rows: Iterable[BenchmarkRow], output_csv: str) -> None:
     fieldnames = [
         "file_path",
@@ -313,6 +493,8 @@ def write_benchmark_csv(rows: Iterable[BenchmarkRow], output_csv: str) -> None:
         "throughput_mb_s",
         "cpu_percent",
         "memory_mb",
+        "simd_tier",
+        "threads_used",
         "digest",
     ]
 
@@ -332,10 +514,16 @@ def write_benchmark_csv(rows: Iterable[BenchmarkRow], output_csv: str) -> None:
                     "throughput_mb_s": f"{row.throughput_mb_s:.3f}",
                     "cpu_percent": f"{row.cpu_percent:.2f}",
                     "memory_mb": f"{row.memory_mb:.2f}",
+                    "simd_tier": row.simd_tier,
+                    "threads_used": row.threads_used,
                     "digest": row.digest,
                 }
             )
 
+
+# ---------------------------------------------------------------------------
+# Summary statistics
+# ---------------------------------------------------------------------------
 
 def summarize_rows(rows: Iterable[BenchmarkRow]) -> dict[str, dict[str, float]]:
     totals: dict[str, dict[str, float]] = {}

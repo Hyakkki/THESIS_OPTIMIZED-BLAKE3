@@ -4,9 +4,10 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
-from forensic_blake3_core import (
+from blake3_engine import (
     benchmark_files_parallel,
     gather_files,
+    get_simd_summary,
     hash_file_baseline,
     hash_file_optimized,
     summarize_rows,
@@ -24,7 +25,8 @@ class Blake3HasherApp(tk.Tk):
 
         self.file_path_var = tk.StringVar()
         self.hash_var = tk.StringVar(value="Hash will appear here")
-        self.status_var = tk.StringVar(value="Choose a file to hash")
+        simd_info = get_simd_summary()
+        self.status_var = tk.StringVar(value=f"SIMD: {simd_info} | Choose a file to hash")
         self.mode_var = tk.StringVar(value="optimized")
         self.repeats_var = tk.IntVar(value=3)
         self.include_blake2_var = tk.BooleanVar(value=False)
@@ -137,14 +139,23 @@ class Blake3HasherApp(tk.Tk):
             else:
                 metrics = hash_file_optimized(file_path)
 
-            self.after(0, lambda: self._on_hash_success(metrics.digest, metrics.elapsed_s, metrics.throughput_mb_s))
+            self.after(0, lambda: self._on_hash_success(
+                metrics.digest, metrics.elapsed_s, metrics.throughput_mb_s,
+                metrics.simd_tier, metrics.threads_used,
+            ))
         except Exception as exc:
             self.after(0, lambda: self._on_hash_error(str(exc)))
 
-    def _on_hash_success(self, digest: str, elapsed_s: float, throughput_mb_s: float) -> None:
+    def _on_hash_success(
+        self, digest: str, elapsed_s: float, throughput_mb_s: float,
+        simd_tier: str, threads_used: int,
+    ) -> None:
         self._busy = False
         self.hash_var.set(digest)
-        self.status_var.set(f"Hash complete | {elapsed_s:.4f}s | {throughput_mb_s:.2f} MB/s")
+        self.status_var.set(
+            f"Hash complete | {elapsed_s:.4f}s | {throughput_mb_s:.2f} MB/s"
+            f" | SIMD: {simd_tier} | Threads: {threads_used}"
+        )
 
     def _on_hash_error(self, error_message: str) -> None:
         self._busy = False
@@ -213,9 +224,11 @@ class Blake3HasherApp(tk.Tk):
         repeats: int,
     ) -> None:
         self._busy = False
+        simd_info = get_simd_summary()
         lines = [
             f"Files processed: {file_count}",
             f"Repeats/file: {repeats}",
+            f"SIMD tier: {simd_info}",
             "",
             "Average Results:",
         ]

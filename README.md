@@ -23,27 +23,27 @@ Requires Python 3.12+ with `tkinter` (included in the standard Windows Python in
 
 **Standard BLAKE3 hasher (simple UI):**
 ```bash
-python standard_blake3_hasher.py
+python simple_hasher.py
 ```
 
 **Optimized vs baseline BLAKE3 hasher + benchmark UI:**
 ```bash
-python blake3_file_hasher_ui.py
+python main_app.py
 ```
 
 **Command-line benchmark:**
 ```bash
-python run_forensic_benchmark.py <path-to-folder>
-python run_forensic_benchmark.py <path-to-folder> --parallel --repeats 5 --include-blake2
+python benchmark.py <path-to-folder>
+python benchmark.py <path-to-folder> --parallel --repeats 5 --include-blake2
 ```
 
 ## Project Structure
 
 ```
-├── forensic_blake3_core.py      # Core hashing engine and benchmark logic
-├── blake3_file_hasher_ui.py     # Tkinter UI for hashing and benchmarking
-├── standard_blake3_hasher.py    # Simple single-file hasher UI
-├── run_forensic_benchmark.py    # CLI benchmark runner
+├── blake3_engine.py             # Core hashing engine and benchmark logic
+├── main_app.py                  # Tkinter UI for hashing and benchmarking
+├── simple_hasher.py             # Simple single-file hasher UI
+├── benchmark.py                 # CLI benchmark runner
 ├── digital_evidence_dataset/    # Put test files here
 └── artifacts/                   # Benchmark CSV outputs
 ```

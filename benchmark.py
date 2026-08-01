@@ -4,10 +4,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from forensic_blake3_core import (
+from blake3_engine import (
     benchmark_files,
     benchmark_files_parallel,
     gather_files,
+    get_simd_summary,
     summarize_rows,
     validate_consistency,
     write_benchmark_csv,
@@ -94,6 +95,7 @@ def main() -> int:
 
     write_benchmark_csv(rows, output)
 
+    print(f"SIMD capabilities: {get_simd_summary()}")
     print(f"Files processed: {len(file_paths)}")
     print(f"Rows written: {len(rows)}")
     print(f"CSV output: {output}")
