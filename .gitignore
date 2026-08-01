@@ -1,7 +1,25 @@
-Cargo.lock
-target
+# Python
+__pycache__/
+*.pyc
+*.pyo
 .venv/
-benchmark_results_*.csv
-research_blake3_toolkit/artifacts/benchmark_results_*.csv
-research_blake3_toolkit/artifacts/benchmark_dataset/
-research_blake3_toolkit/artifacts/benchmark_dataset_small/
+venv/
+*.egg-info/
+
+# Benchmark outputs
+artifacts/benchmark_results_*.csv
+artifacts/benchmark_dataset/
+artifacts/benchmark_dataset_small/
+
+# Dataset (large files - keep out of git)
+digital_evidence_dataset/*.mkv
+digital_evidence_dataset/*.mp4
+digital_evidence_dataset/*.avi
+digital_evidence_dataset/*.iso
+digital_evidence_dataset/*.img
+digital_evidence_dataset/*.dd
+digital_evidence_dataset/*.e01
+
+# IDE
+.vscode/
+.idea/

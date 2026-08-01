@@ -88,7 +88,7 @@ def main() -> int:
     if output is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         script_dir = Path(__file__).resolve().parent
-        artifacts_dir = script_dir / "artifacts"
+        artifacts_dir = script_dir / "artifacts"  
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         output = str((artifacts_dir / f"benchmark_results_{ts}.csv").resolve())
 
