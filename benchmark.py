@@ -30,24 +30,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         default=None,
-        help="Output CSV path. Defaults to research_blake3_toolkit/artifacts/benchmark_results_YYYYMMDD_HHMMSS.csv",
+        help="Output CSV path. Defaults to artifacts/benchmark_results_YYYYMMDD_HHMMSS.csv",
     )
     return parser
 
 
 def print_summary(summary: dict[str, dict[str, float]]) -> None:
-    print("\nAverage results:")
+    print("\n" + "=" * 70)
+    print(f"  {'Mode':<30} {'Throughput (MB/s)':>18} {'Elapsed (s)':>12}")
+    print("=" * 70)
     for key in sorted(summary.keys()):
         stats = summary[key]
         print(
-            (
-                f"{key}: runs={int(stats['runs'])}, "
-                f"elapsed={stats['avg_elapsed_s']:.4f}s, "
-                f"throughput={stats['avg_throughput_mb_s']:.2f} MB/s, "
-                f"cpu={stats['avg_cpu_percent']:.2f}%, "
-                f"memory={stats['avg_memory_mb']:.2f} MB"
-            )
+            f"  {key:<30} "
+            f"{stats['avg_throughput_mb_s']:>18.2f} "
+            f"{stats['avg_elapsed_s']:>12.4f}"
         )
+    print("=" * 70)
 
 
 def main() -> int:

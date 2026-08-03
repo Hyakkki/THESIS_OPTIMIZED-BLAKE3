@@ -200,15 +200,16 @@ def _hash_stream_baseline(file_path: str, chunk_size: int) -> str:
 # Hashing backends – Optimized
 # ---------------------------------------------------------------------------
 
-def _hash_stream_optimized(file_path: str, chunk_size: int) -> str:
+def _hash_stream_optimized(file_path: str, chunk_size: int, use_parallel: bool = True) -> str:
     """Optimized stream: adaptive buffer reuse + multithreaded BLAKE3.
 
     Stages applied:
         1. Adaptive Buffer Handling  – readinto() with pre-allocated buffer
-        2. Multithreaded Processing  – blake3(max_threads=AUTO)
+        2. Multithreaded Processing  – blake3(max_threads=AUTO) for large files,
+                                       blake3(max_threads=1) for small files
         3. SIMD-aware Execution      – automatic inside blake3
     """
-    hasher = blake3(max_threads=blake3.AUTO)
+    hasher = blake3(max_threads=blake3.AUTO if use_parallel else 1)
     buffer, view = adaptive_buffer(chunk_size)
 
     with open(file_path, "rb") as f:
@@ -293,20 +294,26 @@ def hash_file_optimized(file_path: str) -> HashMetrics:
     chunk_size = adaptive_chunk_size(file_size)
     use_mmap = file_size >= MMAP_THRESHOLD
 
+    # --- Stage 2: Multithreaded Processing ---
+    # Only use parallel threads for files large enough to benefit (>= 1 MiB).
+    # For small files, threading overhead exceeds the gain and causes CPU
+    # contention with the Jython extraction process in server mode.
+    use_parallel = file_size >= PARALLEL_MIN_SIZE
+    threads = _available_threads() if use_parallel else 1
+
     # --- Stage 3: SIMD-aware Execution (detection) ---
     simd_caps = detect_simd_capabilities()
     simd_tier = simd_caps["best"]
-    threads = _available_threads()
 
-    # --- Stage 2 & 4: Multithreaded Processing → BLAKE3 Engine ---
+    # --- Stage 4: BLAKE3 Hashing Engine ---
     start = time.perf_counter()
 
     if use_mmap:
         # Large files: memory-mapped I/O + multithreaded BLAKE3
         digest = _hash_mmap_optimized(file_path)
     else:
-        # Smaller files: adaptive buffer reuse + multithreaded BLAKE3
-        digest = _hash_stream_optimized(file_path, chunk_size)
+        # Small/medium files: adaptive buffer reuse, threads based on size
+        digest = _hash_stream_optimized(file_path, chunk_size, use_parallel)
 
     elapsed = time.perf_counter() - start
     throughput = (file_size / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
