@@ -239,7 +239,10 @@ class Blake3HasherApp(tk.Tk):
                 (
                     f"{key} -> runs={int(stats['runs'])}, "
                     f"elapsed={stats['avg_elapsed_s']:.4f}s, "
-                    f"throughput={stats['avg_throughput_mb_s']:.2f} MB/s, "
+                    f"throughput={stats['avg_throughput_mb_s']:.2f} MB/s "
+                    f"(±{stats['stddev_throughput_mb_s']:.2f}, "
+                    f"min={stats['min_throughput_mb_s']:.2f}, "
+                    f"max={stats['max_throughput_mb_s']:.2f}), "
                     f"cpu={stats['avg_cpu_percent']:.2f}%, "
                     f"mem={stats['avg_memory_mb']:.2f} MB"
                 )

@@ -67,48 +67,87 @@ def single_file_mode(file_path: str) -> int:
 
 def server_mode() -> int:
     """
-    Persistent server: read file paths from stdin, write JSON results to stdout.
+    Persistent bytes-streaming server.
 
-    Protocol
-    --------
-    - Client writes: <absolute_file_path>\\n
-    - Server writes: <json_result>\\n
-    - Repeat until stdin is closed (EOF).
+    Protocol (one exchange per file)
+    ---------------------------------
+    1. Client → Server: "<file_size>\\n"     (text line with byte count)
+    2. Client → Server: <file_size> raw bytes (binary, no delimiter)
+    3. Server → Client: <json_result>\\n      (text line with JSON)
 
-    Pre-import the engine once so every subsequent hash call is instant.
+    Benefits over the old path-based protocol
+    ------------------------------------------
+    - No temp file is written to disk → no antivirus scanning
+    - No extra file-system I/O (single read from Autopsy image)
+    - elapsed_s measures ONLY pure BLAKE3 hashing, not I/O waits
+    - Consistent, reproducible execution times across all file sizes
+
+    Runs until stdin is closed (EOF) — i.e., until the ingest job ends.
     """
-    try:
-        from blake3_engine import hash_file_optimized as _warmup  # noqa: F401
-    except Exception:
-        pass  # Will surface as error on first hash attempt
+    # Pre-import engine once so every hash call is instant.
+    from blake3_engine import hash_bytes_optimized  # noqa: PLC0415
 
-    # Use binary stdin/stdout to avoid any line-ending translation issues.
-    stdin = getattr(sys.stdin, "buffer", sys.stdin)
+    stdin  = getattr(sys.stdin,  "buffer", sys.stdin)
     stdout = getattr(sys.stdout, "buffer", sys.stdout)
 
     while True:
+        # --- Step 1: read the file-size header ---
         try:
-            line = stdin.readline()
+            header = stdin.readline()
         except Exception:
             break
+        if not header:
+            break  # EOF — ingest module closed stdin
 
-        if not line:
-            break  # EOF — Autopsy ingest module has closed stdin
-
-        file_path = line.rstrip(b"\r\n").decode("utf-8", errors="replace")
-        if not file_path:
+        header = header.strip()
+        if not header:
             continue
 
         try:
-            result = _hash_to_result(file_path)
+            file_size = int(header)
+        except ValueError:
+            # Malformed header; skip this exchange.
+            result = {"status": "error", "message": "Bad header: " + header.decode("utf-8", "replace")}
+            stdout.write((json.dumps(result) + "\n").encode("utf-8"))
+            stdout.flush()
+            continue
+
+        # --- Step 2: read exactly file_size raw bytes ---
+        data = bytearray()
+        remaining = file_size
+        try:
+            while remaining > 0:
+                chunk = stdin.read(min(65536, remaining))
+                if not chunk:
+                    break
+                data += chunk
+                remaining -= len(chunk)
+        except Exception as exc:
+            result = {"status": "error", "message": "Read error: " + str(exc)}
+            stdout.write((json.dumps(result) + "\n").encode("utf-8"))
+            stdout.flush()
+            continue
+
+        # --- Step 3: hash in memory, send JSON result ---
+        try:
+            metrics = hash_bytes_optimized(bytes(data), file_size)
+            result = {
+                "status":           "ok",
+                "digest":           metrics.digest,
+                "elapsed_s":        round(metrics.elapsed_s, 6),
+                "throughput_mb_s":  round(metrics.throughput_mb_s, 3),
+                "simd_tier":        metrics.simd_tier,
+                "threads_used":     metrics.threads_used,
+                "file_size_bytes":  file_size,
+            }
         except Exception as exc:
             result = {"status": "error", "message": str(exc)}
 
-        out = (json.dumps(result) + "\n").encode("utf-8")
-        stdout.write(out)
+        stdout.write((json.dumps(result) + "\n").encode("utf-8"))
         stdout.flush()
 
     return 0
+
 
 
 def main() -> int:

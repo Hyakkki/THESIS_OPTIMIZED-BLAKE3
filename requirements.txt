@@ -1,0 +1,11 @@
+# Optimized BLAKE3 — Forensic Hashing Toolkit
+# Python 3.12+ required
+
+# Core hashing engine (Rust/C backend with SSE2, AVX2, AVX-512 SIMD)
+blake3>=1.0.0
+
+# Process/resource monitoring (CPU %, memory RSS)
+psutil>=5.9.0
+
+# CPU feature detection (SIMD tier reporting)
+py-cpuinfo>=9.0.0

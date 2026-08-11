@@ -36,17 +36,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def print_summary(summary: dict[str, dict[str, float]]) -> None:
-    print("\n" + "=" * 70)
-    print(f"  {'Mode':<30} {'Throughput (MB/s)':>18} {'Elapsed (s)':>12}")
-    print("=" * 70)
+    print("\n" + "=" * 90)
+    print(f"  {'Mode':<30} {'Avg (MB/s)':>12} {'StdDev':>10} {'Min':>10} {'Max':>10} {'Elapsed (s)':>12}")
+    print("=" * 90)
     for key in sorted(summary.keys()):
         stats = summary[key]
         print(
             f"  {key:<30} "
-            f"{stats['avg_throughput_mb_s']:>18.2f} "
+            f"{stats['avg_throughput_mb_s']:>12.2f} "
+            f"{stats['stddev_throughput_mb_s']:>10.2f} "
+            f"{stats['min_throughput_mb_s']:>10.2f} "
+            f"{stats['max_throughput_mb_s']:>10.2f} "
             f"{stats['avg_elapsed_s']:>12.4f}"
         )
-    print("=" * 70)
+    print("=" * 90)
 
 
 def main() -> int:

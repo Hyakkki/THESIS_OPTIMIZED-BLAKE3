@@ -29,7 +29,6 @@ import subprocess
 
 from jarray import zeros
 
-from java.lang import System
 from java.util import ArrayList
 from org.sleuthkit.autopsy.casemodule import Case
 from org.sleuthkit.autopsy.ingest import FileIngestModule
@@ -51,12 +50,14 @@ class BLAKE3IngestModuleFactory(IngestModuleFactoryAdapter):
     """Factory that Autopsy uses to register and instantiate the module."""
 
     MODULE_NAME = "Optimized BLAKE3 Hasher"
-    MODULE_VERSION = "2.01"
+    MODULE_VERSION = "2.02"
     MODULE_DESCRIPTION = (
         "Hashes each evidence file using an optimized BLAKE3 implementation "
         "with adaptive chunk/buffer handling, multithreaded parallel processing, "
-        "and SIMD-aware execution. The hashing engine runs as a persistent "
-        "sidecar process to eliminate per-file startup overhead. "
+        "and SIMD-aware execution (SSE2 / AVX2 / AVX-512 auto-detected). "
+        "The hashing engine runs as a persistent sidecar process to eliminate "
+        "per-file startup overhead. Execution time measures only the pure BLAKE3 "
+        "hashing step, free of file-system I/O overhead. "
         "Results are stored as Blackboard artifacts."
     )
 
@@ -125,7 +126,7 @@ class BLAKE3FileIngestModule(FileIngestModule):
         )
 
     def process(self, file):
-        """Called for every file. Sends path to the server, reads JSON result."""
+        """Called for every file. Pipelines raw bytes to the server, reads JSON result."""
 
         # Skip directories, unallocated space, and zero-byte files
         if (file.isDir() or
@@ -140,34 +141,45 @@ class BLAKE3FileIngestModule(FileIngestModule):
             self._files_error += 1
             return IngestModule.ProcessResult.OK
 
-        tmp_dir = System.getProperty("java.io.tmpdir")
-        tmp_file = os.path.join(tmp_dir, "blake3_tmp_" + str(file.getId()))
-
         try:
-            # Extract file bytes from the case image using file.read().
-            # Apply & 0xFF to convert Java signed bytes (-128..127) to
-            # Python unsigned bytes (0..255).
             READ_BUF = 65536
             size_bytes = file.getSize()
             buf = zeros(READ_BUF, 'b')
             offset = 0
-            out_f = open(tmp_file, 'wb')
-            try:
-                while offset < size_bytes:
-                    to_read = min(READ_BUF, size_bytes - offset)
-                    n_read = file.read(buf, offset, to_read)
-                    if n_read <= 0:
-                        break
-                    out_f.write(bytearray([(b & 0xFF) for b in buf[:n_read]]))
-                    offset += n_read
-            finally:
-                out_f.close()
 
-            # Send the temp file path to the persistent server process
-            result = self._run_hasher_server(tmp_file)
+            # --- PIPELINE: send header first, then stream each chunk immediately ---
+            # The exe starts reading bytes as soon as the header arrives.
+            # Jython and the exe work simultaneously — no accumulation in memory.
+            stdin = self._proc.stdin
+            stdin.write(str(size_bytes) + "\n")
 
-            if result is None or result.get("status") != "ok":
-                error_msg = result.get("message", "Unknown error") if result else "No output from server"
+            actual_read = 0
+            while offset < size_bytes:
+                to_read = min(READ_BUF, size_bytes - offset)
+                n_read = file.read(buf, offset, to_read)
+                if n_read <= 0:
+                    break
+                # Convert Java signed bytes → Python unsigned, send immediately
+                stdin.write(bytearray([(b & 0xFF) for b in buf[:n_read]]))
+                actual_read += n_read
+                offset += n_read
+
+            # Pad with zeros if fewer bytes read (prevents exe deadlock on short reads)
+            if actual_read < size_bytes:
+                stdin.write(bytearray(size_bytes - actual_read))
+
+            stdin.flush()
+
+            # Read the JSON result from the exe
+            line_out = self._proc.stdout.readline()
+            if not line_out:
+                self._files_error += 1
+                return IngestModule.ProcessResult.OK
+
+            result = json.loads(line_out.strip())
+
+            if result.get("status") != "ok":
+                error_msg = result.get("message", "Unknown error")
                 self._services.postMessage(
                     IngestMessage.createMessage(
                         IngestMessage.MessageType.WARNING,
@@ -191,12 +203,6 @@ class BLAKE3FileIngestModule(FileIngestModule):
                     "Error processing " + file.getName() + ": " + str(exc),
                 )
             )
-        finally:
-            try:
-                if os.path.exists(tmp_file):
-                    os.remove(tmp_file)
-            except Exception:
-                pass
 
         return IngestModule.ProcessResult.OK
 
@@ -228,22 +234,6 @@ class BLAKE3FileIngestModule(FileIngestModule):
     # -----------------------------------------------------------------------
     # Private helpers
     # -----------------------------------------------------------------------
-
-    def _run_hasher_server(self, file_path):
-        """
-        Send a file path to the persistent server process and read one JSON result.
-        Falls back to None on any I/O error.
-        """
-        try:
-            line_in = (file_path + "\n").encode("utf-8")
-            self._proc.stdin.write(line_in)
-            self._proc.stdin.flush()
-            line_out = self._proc.stdout.readline()
-            if not line_out:
-                return None
-            return json.loads(line_out.strip())
-        except Exception as exc:
-            return {"status": "error", "message": str(exc)}
 
     def _post_artifact(self, file, result):
         """Create a custom Blackboard artifact for the BLAKE3 hash result."""

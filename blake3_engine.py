@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import os
+import statistics
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -240,10 +241,25 @@ def _hash_mmap_optimized(file_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def hash_file_baseline(file_path: str) -> HashMetrics:
-    """Baseline BLAKE3: fixed 1 MiB chunks, single-threaded, no optimizations."""
+    """Baseline BLAKE3: fixed 1 MiB chunks, single-threaded, no optimizations.
+
+    Note: the blake3 library uses SIMD (SSE2/AVX2/AVX-512) internally in both
+    baseline and optimized modes — it cannot be disabled.  The SIMD tier reported
+    here reflects the hardware capability passively exploited by the library even
+    in single-threaded mode.  The key differences from the optimized path are:
+      - Fixed 1 MiB chunk size  (no adaptive sizing)
+      - Single-threaded only    (max_threads=1 implicitly via default constructor)
+      - No buffer reuse         (new bytes object allocated per chunk)
+      - No mmap                 (always stream-reads the file)
+    """
     file_size = os.path.getsize(file_path)
     process = psutil.Process(os.getpid())
     start_cpu = process.cpu_times().user + process.cpu_times().system
+
+    # Detect the SIMD tier the hardware supports — same tier is used passively
+    # by the baseline hasher even though it does not configure parallelism.
+    simd_tier = detect_simd_capabilities()["best"]
+
     start = time.perf_counter()
 
     digest = _hash_stream_baseline(file_path, BASELINE_CHUNK_SIZE)
@@ -258,7 +274,7 @@ def hash_file_baseline(file_path: str) -> HashMetrics:
         throughput_mb_s=throughput,
         cpu_percent=_compute_cpu_percent(start_cpu, elapsed),
         memory_mb=_memory_mb(),
-        simd_tier="N/A",
+        simd_tier=simd_tier,
         threads_used=1,
     )
 
@@ -330,6 +346,56 @@ def hash_file_optimized(file_path: str) -> HashMetrics:
     )
 
 
+def hash_bytes_optimized(data: bytes, original_size: int | None = None) -> HashMetrics:
+    """Optimized BLAKE3 on raw bytes already in memory (no file I/O).
+
+    Used by the Autopsy sidecar server to hash bytes received directly
+    through the stdin pipe — no temp file is created or read.
+
+    elapsed_s measures ONLY the pure BLAKE3 hashing step, giving the
+    cleanest possible performance measurement free of file-system and
+    antivirus interference.
+
+    Parameters
+    ----------
+    data          : The raw file bytes to hash.
+    original_size : Optional original file size; uses len(data) if omitted.
+    """
+    file_size = original_size if original_size is not None else len(data)
+    process = psutil.Process(os.getpid())
+    start_cpu = process.cpu_times().user + process.cpu_times().system
+
+    # --- Stage 2: Multithreaded Processing (size-adaptive) ---
+    use_parallel = file_size >= PARALLEL_MIN_SIZE
+    threads = _available_threads() if use_parallel else 1
+
+    # --- Stage 3: SIMD-aware Execution ---
+    simd_caps = detect_simd_capabilities()
+    simd_tier = simd_caps["best"]
+
+    # --- Stage 4: BLAKE3 Hashing Engine ---
+    # All bytes are already in memory. Measure only the hashing step.
+    start = time.perf_counter()
+
+    hasher = blake3(max_threads=blake3.AUTO if use_parallel else 1)
+    hasher.update(data)
+    digest = hasher.hexdigest()
+
+    elapsed = time.perf_counter() - start
+    throughput = (file_size / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
+    return HashMetrics(
+        algorithm="blake3",
+        mode="optimized",
+        digest=digest,
+        elapsed_s=elapsed,
+        throughput_mb_s=throughput,
+        cpu_percent=_compute_cpu_percent(start_cpu, elapsed),
+        memory_mb=_memory_mb(),
+        simd_tier=simd_tier,
+        threads_used=threads,
+    )
+
+
 def hash_file_blake2(file_path: str) -> HashMetrics:
     """BLAKE2b baseline for comparison with the BLAKE algorithm family."""
     file_size = os.path.getsize(file_path)
@@ -385,6 +451,15 @@ def benchmark_files(
     repeats: int = 3,
     include_blake2: bool = False,
 ) -> list[BenchmarkRow]:
+    """Benchmark baseline and optimized BLAKE3 across a list of files.
+
+    A silent warm-up read is performed for each file before any timed runs.
+    This pulls the file into the OS page cache so that neither the baseline
+    nor the optimized path is penalised (or unfairly rewarded) by cold-cache
+    I/O during their respective timed windows.  The warm-up result is tagged
+    with run_index=0 and included in the CSV for transparency but is excluded
+    from summary statistics.
+    """
     rows: list[BenchmarkRow] = []
 
     methods: list[Callable[[str], HashMetrics]] = [hash_file_baseline, hash_file_optimized]
@@ -395,6 +470,30 @@ def benchmark_files(
         file_size = os.path.getsize(file_path)
         file_type = classify_file_type(file_path)
 
+        # --- Warm-up pass: read the file once to populate the OS page cache.
+        # Recorded as run_index=0 so it is visible in the CSV but excluded
+        # from summary statistics (summarize_rows skips run_index == 0).
+        for method in methods:
+            warmup_metrics = method(file_path)
+            rows.append(
+                BenchmarkRow(
+                    file_path=file_path,
+                    file_type=file_type,
+                    file_size_bytes=file_size,
+                    algorithm=warmup_metrics.algorithm,
+                    mode=warmup_metrics.mode,
+                    run_index=0,
+                    elapsed_s=warmup_metrics.elapsed_s,
+                    throughput_mb_s=warmup_metrics.throughput_mb_s,
+                    cpu_percent=warmup_metrics.cpu_percent,
+                    memory_mb=warmup_metrics.memory_mb,
+                    digest=warmup_metrics.digest,
+                    simd_tier=warmup_metrics.simd_tier,
+                    threads_used=warmup_metrics.threads_used,
+                )
+            )
+
+        # --- Timed runs (run_index 1..repeats) ---
         for method in methods:
             for run_index in range(1, repeats + 1):
                 metrics = method(file_path)
@@ -533,35 +632,56 @@ def write_benchmark_csv(rows: Iterable[BenchmarkRow], output_csv: str) -> None:
 # ---------------------------------------------------------------------------
 
 def summarize_rows(rows: Iterable[BenchmarkRow]) -> dict[str, dict[str, float]]:
-    totals: dict[str, dict[str, float]] = {}
+    """Compute summary statistics per algorithm:mode group.
+
+    Only timed runs (run_index >= 1) are included.  Warm-up passes
+    (run_index == 0) are excluded so they do not skew the averages.
+
+    Returned metrics per group
+    --------------------------
+    runs                  : number of timed observations included
+    avg_elapsed_s         : mean elapsed time (seconds)
+    avg_throughput_mb_s   : mean throughput (MB/s)
+    stddev_throughput_mb_s: sample std dev of throughput; 0.0 if <2 runs
+    min_throughput_mb_s   : lowest single-run throughput
+    max_throughput_mb_s   : highest single-run throughput
+    avg_cpu_percent       : mean CPU utilisation (%)
+    avg_memory_mb         : mean process RSS (MB)
+    """
+    # Collect per-group sample lists (warm-up excluded)
+    samples: dict[str, dict[str, list[float]]] = {}
 
     for row in rows:
+        if row.run_index == 0:
+            continue  # skip warm-up passes
         key = f"{row.algorithm}:{row.mode}"
-        entry = totals.setdefault(
+        entry = samples.setdefault(
             key,
             {
-                "runs": 0,
-                "elapsed_sum": 0.0,
-                "throughput_sum": 0.0,
-                "cpu_sum": 0.0,
-                "memory_sum": 0.0,
+                "elapsed": [],
+                "throughput": [],
+                "cpu": [],
+                "memory": [],
             },
         )
-        entry["runs"] += 1
-        entry["elapsed_sum"] += row.elapsed_s
-        entry["throughput_sum"] += row.throughput_mb_s
-        entry["cpu_sum"] += row.cpu_percent
-        entry["memory_sum"] += row.memory_mb
+        entry["elapsed"].append(row.elapsed_s)
+        entry["throughput"].append(row.throughput_mb_s)
+        entry["cpu"].append(row.cpu_percent)
+        entry["memory"].append(row.memory_mb)
 
     summary: dict[str, dict[str, float]] = {}
-    for key, value in totals.items():
-        runs = value["runs"]
+    for key, entry in samples.items():
+        tp = entry["throughput"]
+        runs = len(entry["elapsed"])
         summary[key] = {
-            "runs": runs,
-            "avg_elapsed_s": value["elapsed_sum"] / runs if runs else 0.0,
-            "avg_throughput_mb_s": value["throughput_sum"] / runs if runs else 0.0,
-            "avg_cpu_percent": value["cpu_sum"] / runs if runs else 0.0,
-            "avg_memory_mb": value["memory_sum"] / runs if runs else 0.0,
+            "runs": float(runs),
+            "avg_elapsed_s": statistics.mean(entry["elapsed"]) if runs else 0.0,
+            "avg_throughput_mb_s": statistics.mean(tp) if runs else 0.0,
+            "stddev_throughput_mb_s": statistics.stdev(tp) if runs >= 2 else 0.0,
+            "min_throughput_mb_s": min(tp) if runs else 0.0,
+            "max_throughput_mb_s": max(tp) if runs else 0.0,
+            "avg_cpu_percent": statistics.mean(entry["cpu"]) if runs else 0.0,
+            "avg_memory_mb": statistics.mean(entry["memory"]) if runs else 0.0,
         }
 
     return summary
