@@ -14,7 +14,7 @@ The BLAKE3 algorithm itself is unchanged. Optimization is applied at the **calle
 |---|---|
 | **I/O strategy** | Adaptive chunk sizing, `readinto` + `memoryview`, memory-mapped I/O for large files |
 | **Parallelism** | Multithreaded file processing with `ProcessPoolExecutor` |
-| **SIMD** | Leverages the official `blake3` Rust/C library (SSE2 / AVX2 / AVX-512 auto-detected) |
+| **SIMD** | Leverages the official `blake3` Rust/C library (SSE2 / SSE4.1 / AVX2 / AVX-512 auto-detected) |
 | **Autopsy bridge** | Persistent sidecar exe — starts once per session, not once per file |
 
 ---
@@ -23,16 +23,26 @@ The BLAKE3 algorithm itself is unchanged. Optimization is applied at the **calle
 
 ```
 Autopsy (Jython 2.7)
-  └── AutopsyBLAKE3Ingest.py
-        ├── Reads file bytes via AbstractFile.read() + & 0xFF
-        ├── Writes to temp file
-        └── Sends path over stdin ──► optimized_blake3_hasher.exe (server mode)
-                                              └── blake3_engine.py
-                                                    └── blake3 (Rust/C, AVX-512)
-                                              ◄── JSON result over stdout
+  └── OptimizedBLAKE3Ingest.py
+        ├── Reads file bytes via Content.read() / AbstractFile.read()
+        ├── Writes size header then raw bytes over Java OutputStream
+        └── Streams bytes ──► optimized_blake3_hasher.exe (server mode)
+                                      └── blake3_engine.py
+                                            └── blake3 (Rust/C, AVX-512)
+                                      ◄── JSON result over stdout
 ```
 
 The exe runs as a **persistent server** for the entire ingest session, eliminating the ~100–300 ms startup cost per file that a single-shot approach would incur.
+
+**Server protocol (bytes-streaming):**
+
+| Step | Direction | Content |
+|---|---|---|
+| 1 | Client → Server | `<file_size>\n` (ASCII text line) |
+| 2 | Client → Server | `<file_size>` raw bytes (binary, no delimiter) |
+| 3 | Server → Client | `<json_result>\n` (text line) |
+
+This avoids writing temp files to disk, eliminating antivirus scan overhead and extra filesystem I/O.
 
 ---
 
@@ -43,13 +53,13 @@ The exe runs as a **persistent server** for the entire ingest session, eliminati
 ├── autopsy_hasher.py                   # CLI wrapper (single-file mode + server mode)
 ├── benchmark.py                        # CLI benchmark runner for thesis data
 ├── main_app.py                         # Tkinter UI: hash files and run benchmarks
-├── simple_hasher.py                    # Simple single-file hasher UI
 ├── optimized_blake3_hasher.spec        # PyInstaller spec to rebuild the exe
+├── requirements.txt
 ├── README.md
 │
 ├── autopsy_plugin/
 │   └── BLAKE3_Autopsy_Module/
-│       ├── AutopsyBLAKE3Ingest.py      # Autopsy ingest module (Jython 2.7)
+│       ├── OptimizedBLAKE3Ingest.py   # Autopsy ingest module (Jython 2.7)
 │       ├── optimized_blake3_hasher.exe # Packaged hashing engine (server mode)
 │       └── README.md
 │
@@ -62,7 +72,13 @@ The exe runs as a **persistent server** for the entire ingest session, eliminati
 ## Setup
 
 ```bash
-pip install blake3 psutil
+pip install -r requirements.txt
+```
+
+Or install manually:
+
+```bash
+pip install blake3 psutil py-cpuinfo
 ```
 
 Requires Python 3.12+ with `tkinter` (included in the standard Windows Python installer).
@@ -75,20 +91,17 @@ Requires Python 3.12+ with `tkinter` (included in the standard Windows Python in
 2. Copy the entire `autopsy_plugin/BLAKE3_Autopsy_Module/` folder there
 3. Restart Autopsy
 4. Open or create a case → **Run Ingest** → enable **"Optimized BLAKE3 Hasher"**
-5. After ingest completes, go to **Results → BLAKE3 Hash (Optimized)** in the tree
+5. After ingest completes, go to **Results → Extracted Content → BLAKE3 Hash (Optimized)** in the tree
 
-> **Note:** The plugin starts `optimized_blake3_hasher.exe` once per ingest session in server mode. Do not move or rename the exe — it must be in the same folder as `AutopsyBLAKE3Ingest.py`.
+> **Note:** The plugin starts `optimized_blake3_hasher.exe` once per ingest session in server mode. Do not move or rename the exe — it must be in the same folder as `OptimizedBLAKE3Ingest.py`.
+
+An **HTML report** is automatically generated when the ingest job finishes and registered under the **Reports** node in the Autopsy tree. A pop-up dialog will also appear with the report path and an **Open Report** button.
 
 ---
 
 ## Standalone Usage
 
-**Simple file hasher (UI):**
-```bash
-python simple_hasher.py
-```
-
-**Optimized vs baseline benchmark UI:**
+**Hash files + run benchmarks (UI):**
 ```bash
 python main_app.py
 ```
@@ -97,11 +110,18 @@ python main_app.py
 ```bash
 python benchmark.py digital_evidence_dataset/
 python benchmark.py digital_evidence_dataset/ --parallel --repeats 5
+python benchmark.py digital_evidence_dataset/ --parallel --workers 8
+python benchmark.py digital_evidence_dataset/ --include-blake2
 ```
 
 **Single file from command line:**
 ```bash
 .\autopsy_plugin\BLAKE3_Autopsy_Module\optimized_blake3_hasher.exe <file_path>
+```
+
+**Server mode (used by Autopsy plugin):**
+```bash
+.\autopsy_plugin\BLAKE3_Autopsy_Module\optimized_blake3_hasher.exe --server
 ```
 
 ---
@@ -115,7 +135,7 @@ Place test files in `digital_evidence_dataset/` before benchmarking. Suggested s
 - `audio/` — MP3, WAV, FLAC
 - `video/` — MP4, MKV, AVI
 - `executables/` — EXE, DLL
-- `disk_images/` — ISO, IMG, DD, E01
+- `disk_images/` — ISO, IMG, DD, E01, VMDK, VHD, AFF4
 
 ---
 

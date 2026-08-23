@@ -12,7 +12,7 @@ Results appear in Autopsy's Blackboard as "BLAKE3 Hash (Optimized)" artifacts.
 ## Files in This Folder
 ```
 BLAKE3_Autopsy_Module/
-├── AutopsyBLAKE3Ingest.py       ← Autopsy Jython ingest module
+├── OptimizedBLAKE3Ingest.py     ← Autopsy Jython ingest module
 ├── optimized_blake3_hasher.exe  ← Optimized BLAKE3 engine (standalone)
 └── README.md                    ← This file
 ```
@@ -30,7 +30,7 @@ Copy the entire `BLAKE3_Autopsy_Module/` folder into the `python_modules/` direc
 ```
 python_modules/
 └── BLAKE3_Autopsy_Module/
-    ├── AutopsyBLAKE3Ingest.py
+    ├── OptimizedBLAKE3Ingest.py
     ├── optimized_blake3_hasher.exe
     └── README.md
 ```
