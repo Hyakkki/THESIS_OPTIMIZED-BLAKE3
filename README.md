@@ -106,6 +106,15 @@ An **HTML report** is automatically generated when the ingest job finishes and r
 python main_app.py
 ```
 
+The File Analysis tab reports a RAM-only median for BLAKE3 performance: file
+loading is completed before timing, two warm-up hashes are excluded, and seven
+measured hashes are summarized. Files that fit the RAM budget use a complete
+snapshot. Larger evidence files still receive an authoritative full-file
+digest, while performance is measured on a clearly labelled in-memory prefix.
+The default RAM budget is the smaller of 512 MiB or one quarter of currently
+available memory. It can be overridden in bytes with
+`BLAKE3_MEMORY_BENCHMARK_LIMIT`.
+
 **Command-line benchmark (generates CSV for thesis):**
 ```bash
 python benchmark.py digital_evidence_dataset/

@@ -56,6 +56,38 @@ class HashingTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.digest, blake3.blake3(payload).hexdigest())
 
+    def test_complete_file_snapshot_and_memory_benchmark(self):
+        payload = os.urandom(engine.MIB + 17)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "sample.bin")
+            path.write_bytes(payload)
+            snapshot = engine.load_file_snapshot(path, max_bytes=2 * engine.MIB)
+
+        self.assertTrue(snapshot.complete)
+        self.assertEqual(snapshot.file_size, len(payload))
+        self.assertEqual(snapshot.bytes_loaded, len(payload))
+        result = engine.benchmark_memory(
+            snapshot.data, threads=1, repeats=3, warmups=1
+        )
+        self.assertEqual(result.digest, blake3.blake3(payload).hexdigest())
+        self.assertEqual(result.bytes_hashed, len(payload))
+        self.assertEqual(result.repeats, 3)
+        self.assertEqual(result.threads_used, 1)
+        self.assertGreater(result.median_elapsed_ms, 0)
+        self.assertGreater(result.median_throughput_mib_s, 0)
+
+    def test_capped_file_snapshot_is_labelled_incomplete(self):
+        payload = os.urandom(4096)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "large.bin")
+            path.write_bytes(payload)
+            snapshot = engine.load_file_snapshot(path, max_bytes=1024)
+
+        self.assertFalse(snapshot.complete)
+        self.assertEqual(snapshot.file_size, len(payload))
+        self.assertEqual(snapshot.bytes_loaded, 1024)
+        self.assertEqual(bytes(snapshot.data), payload[:1024])
+
     def test_server_protocol_handles_multiple_requests(self):
         request = io.BytesIO(b"3\nabc0\n")
         response = io.BytesIO()

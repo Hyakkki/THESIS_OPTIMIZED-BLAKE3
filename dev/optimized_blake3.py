@@ -53,6 +53,9 @@ MIB = 1024 * 1024
 # Override with BLAKE3_SMALL_FILE_LIMIT (bytes) for testing.
 SMALL_FILE_LIMIT = int(os.environ.get("BLAKE3_SMALL_FILE_LIMIT", str(32 * MIB)))
 MMAP_MIN_BYTES = 64 * MIB
+DEFAULT_MEMORY_BENCHMARK_LIMIT = int(
+    os.environ.get("BLAKE3_MEMORY_BENCHMARK_LIMIT", str(512 * MIB))
+)
 KNOWN_VECTORS = {
     b"": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
     b"abc": "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
@@ -95,6 +98,36 @@ class HashResult:
         return result
 
 
+@dataclass
+class MemoryBenchmarkResult:
+    """Summary of repeated BLAKE3 runs over an already-resident buffer."""
+
+    digest: str
+    bytes_hashed: int
+    repeats: int
+    warmups: int
+    median_elapsed_ms: float
+    median_throughput_mib_s: float
+    min_throughput_mib_s: float
+    max_throughput_mib_s: float
+    elapsed_samples_ms: List[float]
+    threads_used: int
+    timing_scope: str = "hasher creation+memory hash+digest finalization"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class FileSnapshot:
+    """Stable file bytes prepared outside the benchmark timer."""
+
+    data: bytearray
+    file_size: int
+    bytes_loaded: int
+    complete: bool
+
+
 def physical_cpu_count() -> int:
     """Return physical cores when psutil can distinguish them."""
     if _psutil is not None:
@@ -110,6 +143,134 @@ def logical_cpu_count() -> int:
         if count:
             return max(1, int(count))
     return max(1, int(os.cpu_count() or 1))
+
+
+def recommended_memory_benchmark_limit() -> int:
+    """Return a conservative RAM budget for the interactive benchmark."""
+    configured = max(1 * MIB, DEFAULT_MEMORY_BENCHMARK_LIMIT)
+    if _psutil is None:
+        return configured
+    try:
+        # Leave ample headroom for Windows, Tk, and the native worker pool.
+        available = int(_psutil.virtual_memory().available)
+        return max(16 * MIB, min(configured, available // 4))
+    except Exception:
+        return configured
+
+
+def load_file_snapshot(
+    path: os.PathLike[str] | str,
+    *,
+    max_bytes: Optional[int] = None,
+) -> FileSnapshot:
+    """Load a stable file or prefix into owned RAM, without timing the I/O.
+
+    When ``max_bytes`` is smaller than the file, the returned data is a prefix
+    used only as a content-representative algorithm benchmark.  ``complete``
+    distinguishes that case from a snapshot whose digest represents the whole
+    file.
+    """
+    file_path = Path(path)
+    before = file_path.stat()
+    file_size = int(before.st_size)
+    if max_bytes is not None and int(max_bytes) < 0:
+        raise ValueError("max_bytes must be non-negative or None")
+    bytes_to_load = file_size if max_bytes is None else min(file_size, int(max_bytes))
+
+    data = bytearray(bytes_to_load)
+    view = memoryview(data)
+    offset = 0
+    try:
+        with file_path.open("rb", buffering=0) as source:
+            while offset < bytes_to_load:
+                count = source.readinto(view[offset:])
+                if not count:
+                    raise EOFError(
+                        "short read: expected %d bytes, received %d"
+                        % (bytes_to_load, offset)
+                    )
+                offset += count
+    finally:
+        view.release()
+
+    after = file_path.stat()
+    identity_changed = (
+        int(after.st_size) != file_size
+        or int(after.st_mtime_ns) != int(before.st_mtime_ns)
+        or (
+            getattr(before, "st_ino", 0)
+            and getattr(after, "st_ino", 0)
+            and before.st_ino != after.st_ino
+        )
+    )
+    if identity_changed:
+        raise RuntimeError("file changed while the in-memory snapshot was loaded")
+
+    return FileSnapshot(
+        data=data,
+        file_size=file_size,
+        bytes_loaded=bytes_to_load,
+        complete=bytes_to_load == file_size,
+    )
+
+
+def benchmark_memory(
+    data: bytes | bytearray | memoryview,
+    *,
+    threads: Optional[int] = None,
+    repeats: int = 7,
+    warmups: int = 2,
+) -> MemoryBenchmarkResult:
+    """Measure native BLAKE3 over memory, excluding all file-system work."""
+    if repeats < 1:
+        raise ValueError("repeats must be at least 1")
+    if warmups < 1:
+        raise ValueError("warmups must be at least 1")
+
+    max_threads = physical_cpu_count() if threads is None else max(1, int(threads))
+    source = memoryview(data)
+    if not source.c_contiguous:
+        raise ValueError("benchmark input must be C-contiguous")
+    source = source.toreadonly()
+
+    expected: Optional[bytes] = None
+    for _ in range(warmups):
+        current = _blake3_module.blake3(
+            source, max_threads=max_threads
+        ).digest()
+        if expected is None:
+            expected = current
+        elif current != expected:
+            raise RuntimeError("BLAKE3 digest changed during benchmark warm-up")
+
+    elapsed_ns: List[int] = []
+    for _ in range(repeats):
+        started = time.perf_counter_ns()
+        current = _blake3_module.blake3(
+            source, max_threads=max_threads
+        ).digest()
+        duration = max(1, time.perf_counter_ns() - started)
+        if current != expected:
+            raise RuntimeError("BLAKE3 digest changed between benchmark repetitions")
+        elapsed_ns.append(duration)
+
+    elapsed_ms = [duration / 1e6 for duration in elapsed_ns]
+    throughput = [
+        (len(source) / MIB) / (duration / 1e9) if len(source) else 0.0
+        for duration in elapsed_ns
+    ]
+    return MemoryBenchmarkResult(
+        digest=(expected or b"").hex(),
+        bytes_hashed=len(source),
+        repeats=repeats,
+        warmups=warmups,
+        median_elapsed_ms=round(statistics.median(elapsed_ms), 3),
+        median_throughput_mib_s=round(statistics.median(throughput), 3),
+        min_throughput_mib_s=round(min(throughput), 3),
+        max_throughput_mib_s=round(max(throughput), 3),
+        elapsed_samples_ms=[round(value, 3) for value in elapsed_ms],
+        threads_used=max_threads,
+    )
 
 
 def adaptive_chunk_size(size_bytes: int) -> int:

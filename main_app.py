@@ -30,25 +30,33 @@ _MODULE_DIR = Path(__file__).resolve().parent / "dev"
 if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
-from optimized_blake3 import detected_simd_tier, hash_file   # noqa: E402
+from optimized_blake3 import (                              # noqa: E402
+    MIB,
+    benchmark_memory,
+    detected_simd_tier,
+    hash_file,
+    load_file_snapshot,
+    physical_cpu_count,
+    recommended_memory_benchmark_limit,
+)
 from benchmark_blake3 import benchmark_files, _write_csv     # noqa: E402
 
 import blake3 as _blake3                                     # noqa: E402
 
 # ── palette ───────────────────────────────────────────────────────────────────
-_BG      = "#0f1117"
-_SURF    = "#1a1d27"
-_SURF2   = "#22263a"
-_ACCENT  = "#5c7cfa"
-_ACCENT2 = "#845ef7"
-_GREEN   = "#51cf66"
-_YELLOW  = "#fcc419"
-_RED     = "#ff6b6b"
-_TEXT    = "#e8eaf6"
-_SUB     = "#9fa8da"
-_BORDER  = "#2e3250"
+_BG      = "#f1f5f9"
+_SURF    = "#ffffff"
+_SURF2   = "#f8fafc"
+_ACCENT  = "#0f766e"
+_ACCENT2 = "#115e59"
+_GREEN   = "#15803d"
+_YELLOW  = "#a16207"
+_RED     = "#b91c1c"
+_TEXT    = "#0f172a"
+_SUB     = "#64748b"
+_BORDER  = "#e2e8f0"
 
-_FH1  = ("Segoe UI", 17, "bold")
+_FH1  = ("Segoe UI", 22, "bold")
 _FH2  = ("Segoe UI", 12, "bold")
 _FH3  = ("Segoe UI", 10, "bold")
 _FBOD = ("Segoe UI", 10)
@@ -80,70 +88,15 @@ def _kv(parent: tk.Frame, label: str, attr: str,
         label_w: int = 22) -> tk.StringVar:
     """Add a key/value row to a card, return the StringVar."""
     row = tk.Frame(parent, bg=_SURF)
-    row.pack(fill="x", padx=14, pady=2)
+    row.pack(fill="x", padx=18, pady=5)
     tk.Label(row, text=label, bg=_SURF, fg=_SUB, font=_FCAP,
-             width=label_w, anchor="w").pack(side="left")
+             anchor="w").pack(anchor="w")
     var = tk.StringVar(value="—")
     vars_dict[attr] = var
     tk.Label(row, textvariable=var, bg=_SURF, fg=_TEXT,
-             font=_FMON, anchor="w").pack(side="left", fill="x", expand=True)
+             font=("Segoe UI", 10, "bold"), anchor="w",
+             wraplength=290, justify="left").pack(fill="x", expand=True)
     return var
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Minimal canvas bar chart
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _BarChart(tk.Canvas):
-    def __init__(self, parent: tk.Widget, chart_w: int = 440, chart_h: int = 130, **kw):
-        super().__init__(parent, width=chart_w, height=chart_h,
-                         bg=_SURF2, highlightthickness=0, **kw)
-
-    def draw(self, values: List[float], labels: List[str] | None = None,
-             color: str = _ACCENT, title: str = "",
-             ref_line: float | None = None) -> None:
-        self.delete("all")
-        w = int(self["width"])
-        h = int(self["height"])
-
-        pl, pr, pt, pb = 46, 10, 20, 26
-
-        if title:
-            self.create_text(w // 2, 10, text=title, fill=_SUB,
-                             font=_FCAP, anchor="center")
-        if not values:
-            return
-
-        mx = max(values) or 1
-        n  = len(values)
-        sw = (w - pl - pr) / n
-        bw = max(2.0, sw * 0.72)
-        ch = h - pt - pb
-
-        # grid lines
-        for i in range(5):
-            yv = mx * i / 4
-            y  = pt + ch - (yv / mx) * ch
-            self.create_text(pl - 4, y, text=f"{yv:.0f}",
-                             fill=_SUB, font=("Segoe UI", 7), anchor="e")
-            self.create_line(pl, y, w - pr, y, fill=_BORDER, dash=(2, 4))
-
-        # optional horizontal reference line (e.g. 50 % for distribution)
-        if ref_line is not None and 0 < ref_line <= mx:
-            ry = pt + ch - (ref_line / mx) * ch
-            self.create_line(pl, ry, w - pr, ry, fill=_YELLOW,
-                             dash=(4, 3), width=1)
-
-        for i, v in enumerate(values):
-            xc  = pl + (i + 0.5) * sw
-            bh  = (v / mx) * ch
-            x0, x1 = xc - bw / 2, xc + bw / 2
-            y0, y1 = pt + ch - bh, pt + ch
-            self.create_rectangle(x0, y0, x1, y1,
-                                  fill=color, outline="", width=0)
-            if labels and i < len(labels):
-                self.create_text(xc, h - pb + 5, text=labels[i],
-                                 fill=_SUB, font=("Segoe UI", 7), anchor="n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,21 +118,22 @@ class _Scroll(tk.Frame):
                             scrollregion=self._cv.bbox("all")))
         self._cv.bind("<Configure>",
                       lambda e: self._cv.itemconfig(self._wid, width=e.width))
-        self._cv.bind_all("<MouseWheel>",
-                          lambda e: self._cv.yview_scroll(
-                              int(-1 * (e.delta / 120)), "units"))
+        self._cv.bind_all("<MouseWheel>", self._on_wheel, add="+")
+
+    def _on_wheel(self, event):
+        if not self.winfo_ismapped():
+            return
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        while widget is not None:
+            if widget == self:
+                self._cv.yview_scroll(int(-event.delta / 120), "units")
+                return
+            widget = widget.master
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker: all analyses for one file
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _read_file_bytes(path: str, max_bytes: int = 4 * 1024 * 1024) -> bytes:
-    """Read up to max_bytes from the file for in-memory tests."""
-    size = os.path.getsize(path)
-    with open(path, "rb") as f:
-        return f.read(min(size, max_bytes))
-
 
 def _run_avalanche(data: bytes, samples: int = 200) -> Dict[str, Any]:
     """
@@ -237,17 +191,18 @@ def _run_avalanche(data: bytes, samples: int = 200) -> Dict[str, Any]:
     }
 
 
-def _run_collision(digest_hex: str, data: bytes,
-                   n_variants: int = 500) -> Dict[str, Any]:
+def _run_collision(data: bytes, n_variants: int = 500) -> Dict[str, Any]:
     """
     Collision check on the ACTUAL file.
 
-    Generates n_variants modified copies of the file (each with a tiny
-    perturbation appended) and verifies none produces the same digest.
-    Also checks single-thread == multi-thread consistency.
+    Generates n_variants modified copies of the analysis sample, checks every
+    resulting digest for duplicates, and verifies that single-thread and
+    automatic-thread hashing return identical results.
     """
-    original_digest = digest_hex
-    collisions: List[int] = []
+    original_digest = _blake3.blake3(data, max_threads=1).hexdigest()
+    digests = [original_digest]
+    seen = {original_digest: "original sample"}
+    collisions: List[Tuple[str, str]] = []
     inconsistent: List[int] = []
 
     rng = random.Random(0xC0111510)
@@ -259,81 +214,73 @@ def _run_collision(digest_hex: str, data: bytes,
         h2 = _blake3.blake3(variant, max_threads=_blake3.blake3.AUTO).hexdigest()
         if h1 != h2:
             inconsistent.append(i)
-        if h1 == original_digest:
-            collisions.append(i)
+        input_name = f"modified sample {i + 1}"
+        if h1 in seen:
+            collisions.append((seen[h1], input_name))
+        else:
+            seen[h1] = input_name
+        digests.append(h1)
 
     passed = not collisions and not inconsistent
     return {
         "passed": passed,
+        "inputs_tested": n_variants + 1,
         "variants_tested": n_variants,
         "collisions": len(collisions),
         "inconsistent": len(inconsistent),
+        "digests": digests,
         "note": (
-            f"Tested {n_variants} modified versions of your file "
-            "(each with a unique 16-byte salt appended). "
-            "None should produce the same digest as the original."
+            f"Screened the original analysis sample and {n_variants} modified "
+            "versions for duplicate hashes. This is an empirical check, not "
+            "a mathematical proof of collision resistance."
         ),
     }
 
 
-def _run_distribution(digest_hex: str) -> Dict[str, Any]:
+def _run_distribution(digest_hexes: List[str]) -> Dict[str, Any]:
     """
-    Bit/byte distribution analysis of the ACTUAL file's digest.
+    Bit/byte distribution analysis across actual BLAKE3 digests.
 
-    Checks that the 256 output bits are well-spread (each should be ~50 %),
-    and that the 32 output bytes cover the byte-value space reasonably.
+    Counts zero and one bits across the original analysis sample plus its
+    modified versions. A balanced result should be close to 50 % ones.
     """
-    digest_bytes = bytes.fromhex(digest_hex)   # 32 bytes = 256 bits
+    if not digest_hexes:
+        return {"passed": False, "error": "no digests supplied"}
 
-    # bit frequency
-    bits_set = sum(b.bit_count() for b in digest_bytes)
-    bit_freq  = bits_set / 256
+    digest_values = [bytes.fromhex(value) for value in digest_hexes]
+    if any(len(value) != 32 for value in digest_values):
+        return {"passed": False, "error": "invalid BLAKE3 digest length"}
 
-    # per-bit values as % (each is 0 or 100 for a single digest,
-    # but we compute it across 256 hashes of seeded variants for a richer view)
-    rng = random.Random(0xD1578)
-    n_sample = 500
-    bit_counts  = [0] * 256
-    byte_counts = [0] * 256
+    bits_set = sum(byte.bit_count() for digest in digest_values for byte in digest)
+    total_bits = len(digest_values) * 256
+    bits_clear = total_bits - bits_set
+    bit_freq = bits_set / total_bits
 
-    # include the actual file digest first
-    for byte_i, bv in enumerate(digest_bytes):
-        byte_counts[bv] += 1
-        for bit_i in range(8):
-            if bv & (1 << bit_i):
-                bit_counts[byte_i * 8 + bit_i] += 1
-
-    # then near-variants (file digest XOR'd with counter)
-    for i in range(1, n_sample):
-        ctr = i.to_bytes(4, "little") + rng.randbytes(28)
-        variant_digest = bytes(a ^ b for a, b in zip(digest_bytes, ctr))
-        for byte_i, bv in enumerate(variant_digest):
-            byte_counts[bv] += 1
+    bit_counts = [0] * 256
+    for digest in digest_values:
+        for byte_i, byte_value in enumerate(digest):
             for bit_i in range(8):
-                if bv & (1 << bit_i):
+                if byte_value & (1 << bit_i):
                     bit_counts[byte_i * 8 + bit_i] += 1
 
-    total_n   = n_sample  # digests sampled
-    bit_pcts  = [bit_counts[i] / total_n * 100 for i in range(64)]
-
-    # byte bucket groups (16 groups of 16 byte values)
-    groups = [sum(byte_counts[g * 16:(g + 1) * 16]) for g in range(16)]
-
-    expected_bit_pct = 50.0
-    passed = 0.47 <= bit_freq <= 0.53   # loose check for single digest
+    position_pcts = [count / len(digest_values) * 100 for count in bit_counts]
+    passed = 0.48 <= bit_freq <= 0.52
 
     return {
         "passed": passed,
         "digest_bits": 256,
+        "digests_tested": len(digest_values),
+        "total_bits": total_bits,
         "bits_set": bits_set,
+        "bits_clear": bits_clear,
         "bit_freq_pct": round(bit_freq * 100, 2),
         "expected_pct": 50.0,
-        "bit_pcts_64": bit_pcts,           # first 64 positions
-        "byte_groups": groups,             # 16 groups
-        "byte_group_labels": [str(g * 16) for g in range(16)],
+        "position_min_pct": round(min(position_pcts), 2),
+        "position_max_pct": round(max(position_pcts), 2),
         "note": (
-            "Bit-frequency and byte distribution of your file's BLAKE3 digest, "
-            "cross-checked against 499 near-variants."
+            "Counts zeros and ones across real BLAKE3 outputs from the original "
+            "analysis sample and its modified versions. This is a distribution "
+            "diagnostic, not proof that the hash is random."
         ),
     }
 
@@ -347,12 +294,19 @@ class FileAnalysisTab(tk.Frame):
 
     _AVALANCHE_SAMPLES = 200
     _COLLISION_VARIANTS = 300
+    _BENCHMARK_REPEATS = 7
+    _BENCHMARK_WARMUPS = 2
+    _MODE_LABELS = {
+        "Optimized (recommended)": "optimized",
+        "Baseline (comparison)": "baseline",
+    }
 
     def __init__(self, parent: tk.Widget, status_var: tk.StringVar):
         super().__init__(parent, bg=_BG)
         self._status_var = status_var
         self._busy = False
         self._file_path: str = ""
+        self._run_mode = "optimized"
         self._build()
 
     # ── layout ────────────────────────────────────────────────────────────────
@@ -365,11 +319,9 @@ class FileAnalysisTab(tk.Frame):
         tk.Label(ctrl, text="File Analysis", bg=_BG, fg=_TEXT,
                  font=_FH1).pack(anchor="w")
         tk.Label(ctrl,
-                 text=("Select a file to hash it with the optimized BLAKE3 engine, "
-                       "then automatically see the Avalanche Effect, Collision "
-                       "Resistance, and Hash Distribution applied to THAT file."),
-                 bg=_BG, fg=_SUB, font=_FBOD, wraplength=820,
-                 justify="left").pack(anchor="w", pady=(2, 10))
+                  text="Create a file fingerprint. Measure performance. Explore hash behavior.",
+                  bg=_BG, fg=_SUB, font=_FBOD, wraplength=820,
+                  justify="left").pack(anchor="w", pady=(2, 10))
 
         # file-picker row
         pick = _card(self)
@@ -377,7 +329,7 @@ class FileAnalysisTab(tk.Frame):
         inner = tk.Frame(pick, bg=_SURF)
         inner.pack(fill="x", padx=14, pady=10)
 
-        _cap(inner, "FILE PATH").pack(anchor="w", pady=(0, 4))
+        _cap(inner, "EVIDENCE FILE").pack(anchor="w", pady=(0, 8))
         row = tk.Frame(inner, bg=_SURF)
         row.pack(fill="x")
 
@@ -393,20 +345,20 @@ class FileAnalysisTab(tk.Frame):
                   ).pack(side="left", padx=(0, 8))
 
         self._hash_btn = tk.Button(
-            row, text="⚡  Hash & Analyse", command=self._start,
+            row, text="Analyze file  →", command=self._start,
             bg=_ACCENT, fg="#fff", relief="flat", font=_FH3,
-            padx=18, pady=4, cursor="hand2",
+            padx=22, pady=7, cursor="hand2",
             activebackground=_ACCENT2, activeforeground="#fff")
         self._hash_btn.pack(side="left")
 
         # mode selector
         opt = tk.Frame(inner, bg=_SURF)
         opt.pack(fill="x", pady=(8, 0))
-        tk.Label(opt, text="Engine mode:", bg=_SURF, fg=_SUB, font=_FCAP,
-                 ).pack(side="left")
-        self._mode_var = tk.StringVar(value="optimized")
+        tk.Label(opt, text="Processing mode:", bg=_SURF, fg=_SUB, font=_FCAP,
+                  ).pack(side="left")
+        self._mode_var = tk.StringVar(value="Optimized (recommended)")
         ttk.Combobox(opt, textvariable=self._mode_var,
-                     values=["baseline", "optimized"], width=12,
+                     values=list(self._MODE_LABELS), width=24,
                      state="readonly").pack(side="left", padx=(8, 0))
 
         # progress bar (hidden until running)
@@ -418,13 +370,13 @@ class FileAnalysisTab(tk.Frame):
         body = self._scroll.inner
 
         # ── Section A: Digest + perf metrics ─────────────────────────────────
-        self._s_hash = self._section(body, "A  |  BLAKE3 Digest & Performance")
-        self._digest_var = tk.StringVar(value="Hash will appear here after you click 'Hash & Analyse'")
+        self._s_hash = self._section(body, "File fingerprint", subtitle="BLAKE3 · 256-bit hash")
+        self._digest_var = tk.StringVar(value="The file's BLAKE3 hash will appear here")
         tk.Label(self._s_hash, textvariable=self._digest_var,
-                 bg=_SURF, fg=_GREEN, font=("Consolas", 10),
+                 bg=_SURF2, fg=_ACCENT, font=("Consolas", 11),
                  anchor="w", wraplength=820, justify="left",
-                 padx=10, pady=8,
-                 ).pack(fill="x", padx=14, pady=(0, 6))
+                 padx=16, pady=16,
+                 ).pack(fill="x", padx=18, pady=(4, 10))
 
         # copy button
         tk.Button(self._s_hash, text="Copy digest", command=self._copy_hash,
@@ -435,141 +387,159 @@ class FileAnalysisTab(tk.Frame):
         # metric tiles
         self._mf = tk.Frame(self._s_hash, bg=_SURF)
         self._mf.pack(fill="x", padx=14, pady=(0, 12))
-        for c in range(4):
-            self._mf.columnconfigure(c, weight=1)
+        for c in range(2):
+            self._mf.columnconfigure(c, weight=1, uniform="metrics")
         self._mv: Dict[str, tk.StringVar] = {}
         for i, (lbl, key) in enumerate([
-            ("Elapsed",    "elapsed"),
-            ("Throughput", "throughput"),
-            ("SIMD Tier",  "simd"),
-            ("Threads",    "threads"),
+            ("Typical time (median)", "elapsed"),
+            ("Processing speed",      "throughput"),
+            ("CPU acceleration",      "simd"),
+            ("Worker threads",        "threads"),
         ]):
             cell = tk.Frame(self._mf, bg=_SURF2,
                             highlightbackground=_BORDER, highlightthickness=1)
-            cell.grid(row=0, column=i, padx=4, pady=4, sticky="nsew")
+            cell.grid(row=i // 2, column=i % 2, padx=4, pady=4, sticky="nsew")
             tk.Label(cell, text=lbl, bg=_SURF2, fg=_SUB, font=_FCAP,
                      ).pack(anchor="w", padx=8, pady=(6, 0))
             var = tk.StringVar(value="—")
             self._mv[key] = var
             tk.Label(cell, textvariable=var, bg=_SURF2, fg=_TEXT,
-                     font=("Segoe UI", 11, "bold"),
+                     font=("Segoe UI", 20 if i < 2 else 10, "bold"),
+                     wraplength=420, justify="left",
                      ).pack(anchor="w", padx=8, pady=(0, 6))
+
+        self._perf_note_var = tk.StringVar(
+            value=("Performance uses repeated in-memory BLAKE3 trials; "
+                   "file loading is excluded from the timer.")
+        )
+        tk.Label(self._s_hash, textvariable=self._perf_note_var,
+                 bg=_SURF, fg=_SUB, font=_FCAP, anchor="w",
+                 wraplength=820, justify="left",
+                 ).pack(fill="x", padx=14, pady=(0, 12))
+
+        checks_heading = tk.Frame(body, bg=_BG)
+        checks_heading.pack(fill="x", padx=20, pady=(24, 4))
+        tk.Label(checks_heading, text="Hash behavior", bg=_BG, fg=_TEXT,
+                 font=_FH2).pack(anchor="w")
+        tk.Label(checks_heading, text="Three diagnostics from the selected file sample",
+                 bg=_BG, fg=_SUB, font=_FCAP).pack(anchor="w", pady=(3, 0))
+        self._checks = tk.Frame(body, bg=_BG)
+        self._checks.pack(fill="x", padx=14, pady=(0, 20))
+        self._checks.bind("<Configure>", self._layout_checks)
 
         # ── Section B: Avalanche ──────────────────────────────────────────────
         self._s_av = self._section(
-            body,
-            "B  |  Avalanche Effect  —  applied to your file",
+            self._checks,
+            "Avalanche effect",
             subtitle=(
-                f"Flips {self._AVALANCHE_SAMPLES} individual bits inside your file "
-                "and measures how many BLAKE3 output bits change each time. "
-                "Expected: ~128 of 256 bits change (50 %)."
-            ))
-        self._av: Dict[str, tk.StringVar] = {}
-        av_kv = [
-            ("Status",            "status"),
-            ("Samples (bit flips)", "samples"),
-            ("Mean Δ bits",        "mean"),
-            ("Mean Δ %",           "mean_pct"),
-            ("Std-dev",            "stddev"),
-            ("Min Δ bits",         "minimum"),
-            ("Max Δ bits",         "maximum"),
-            ("Expected mean",      "expected"),
-        ]
-        av_cols = tk.Frame(self._s_av, bg=_SURF)
-        av_cols.pack(fill="x", padx=14, pady=(0, 12))
-        av_left = tk.Frame(av_cols, bg=_SURF)
-        av_left.pack(side="left", fill="y")
-        for lbl, key in av_kv:
-            _kv(av_left, lbl, key, self._av, label_w=24)
-        self._av_chart = _BarChart(av_cols, 380, 140)
-        self._av_chart.pack(side="left", fill="both", expand=True, padx=(12, 0))
-        self._av_note = tk.Label(
-            body, text="", bg=_BG, fg=_SUB, font=_FCAP,
-            wraplength=820, justify="left")
-        self._av_note.pack(anchor="w", padx=22, pady=(0, 4))
+                "Measures how much the hash changes when one input bit changes. "
+                "Expected average: about 50%."
+            ), column=0)
+        self._av_result_var = tk.StringVar(value="Waiting for analysis")
+        self._av_result_label = tk.Label(
+            self._s_av, textvariable=self._av_result_var,
+            bg=_SURF, fg=_SUB, font=("Segoe UI", 12, "bold"), anchor="w",
+            wraplength=290, justify="left",
+        )
+        self._av_result_label.pack(fill="x", padx=14, pady=(10, 5))
+        self._av: Dict[str, tk.StringVar] = {"average": tk.StringVar(value="—")}
+        for lbl, key in [
+            ("Expected result",     "expected"),
+            ("One-bit changes tested", "samples"),
+            ("Observed range",      "range"),
+            ("Test scope",          "scope"),
+        ]:
+            _kv(self._s_av, lbl, key, self._av, label_w=24)
+        self._featured_value(self._s_av, self._av["average"], "AVERAGE HASH CHANGE")
 
         # ── Section C: Collision Resistance ───────────────────────────────────
         self._s_col = self._section(
-            body,
-            "C  |  Collision Resistance  —  applied to your file",
+            self._checks,
+            "Collision screening",
             subtitle=(
-                f"Generates {self._COLLISION_VARIANTS} modified copies of your "
-                "file (each with a unique appended salt) and verifies none "
-                "produces the same BLAKE3 digest. "
-                "Also checks single-thread == multi-thread consistency."
-            ))
-        self._col: Dict[str, tk.StringVar] = {}
+                f"Checks the original sample and {self._COLLISION_VARIANTS} "
+                "modified versions for duplicate hashes. Results apply to the tested inputs."
+            ), column=1)
+        self._col_result_var = tk.StringVar(value="Waiting for analysis")
+        self._col_result_label = tk.Label(
+            self._s_col, textvariable=self._col_result_var,
+            bg=_SURF, fg=_SUB, font=("Segoe UI", 12, "bold"), anchor="w",
+            wraplength=290, justify="left",
+        )
+        self._col_result_label.pack(fill="x", padx=14, pady=(10, 5))
+        self._col: Dict[str, tk.StringVar] = {"collisions": tk.StringVar(value="—")}
         for lbl, key in [
-            ("Status",               "status"),
-            ("Variants tested",      "variants"),
-            ("Collisions detected",  "collisions"),
-            ("Threading consistent", "threading"),
+            ("Inputs compared",       "inputs"),
+            ("Repeatability check",   "threading"),
+            ("Test scope",            "scope"),
         ]:
             _kv(self._s_col, lbl, key, self._col, label_w=26)
-        self._col_note = tk.Label(
-            body, text="", bg=_BG, fg=_SUB, font=_FCAP,
-            wraplength=820, justify="left")
-        self._col_note.pack(anchor="w", padx=22, pady=(0, 4))
+        self._featured_value(self._s_col, self._col["collisions"], "DUPLICATE HASHES")
 
         # ── Section D: Hash Distribution ──────────────────────────────────────
         self._s_dist = self._section(
-            body,
-            "D  |  Hash Distribution  —  your file's digest",
+            self._checks,
+            "Hash distribution",
             subtitle=(
-                "Analyses the bit and byte spread of your file's BLAKE3 digest. "
-                "Bit frequency should be ~50 % set across the 256 output bits. "
-                "Byte-value groups should be roughly uniform."
-            ))
-        self._dist: Dict[str, tk.StringVar] = {}
-        dist_cols = tk.Frame(self._s_dist, bg=_SURF)
-        dist_cols.pack(fill="x", padx=14, pady=(0, 12))
-        dist_left = tk.Frame(dist_cols, bg=_SURF)
-        dist_left.pack(side="left", fill="y")
+                "Counts zeros and ones across the tested hashes. "
+                "Expected balance: approximately 50% each."
+            ), column=2)
+        self._dist_result_var = tk.StringVar(value="Waiting for analysis")
+        self._dist_result_label = tk.Label(
+            self._s_dist, textvariable=self._dist_result_var,
+            bg=_SURF, fg=_SUB, font=("Segoe UI", 12, "bold"), anchor="w",
+            wraplength=290, justify="left",
+        )
+        self._dist_result_label.pack(fill="x", padx=14, pady=(10, 5))
+        self._dist: Dict[str, tk.StringVar] = {"freq": tk.StringVar(value="—")}
         for lbl, key in [
-            ("Status",           "status"),
-            ("Digest bits",      "bits"),
-            ("Bits set (1s)",    "bits_set"),
-            ("Bit frequency",    "freq"),
-            ("Expected freq",    "expected"),
+            ("Hash outputs examined", "digests"),
+            ("Total bits examined",   "total_bits"),
+            ("Ones / zeros counted",  "counts"),
+            ("Expected balance",       "expected"),
         ]:
-            _kv(dist_left, lbl, key, self._dist, label_w=18)
+            _kv(self._s_dist, lbl, key, self._dist, label_w=24)
+        self._featured_value(self._s_dist, self._dist["freq"], "OUTPUT BIT BALANCE")
 
-        dist_charts = tk.Frame(dist_cols, bg=_SURF)
-        dist_charts.pack(side="left", fill="both", expand=True, padx=(12, 0))
+    @staticmethod
+    def _featured_value(card, variable, caption):
+        featured = tk.Frame(card, bg=_SURF2)
+        tk.Label(featured, text=caption, bg=_SURF2, fg=_SUB,
+                 font=_FCAP, anchor="w").pack(fill="x", padx=12, pady=(12, 2))
+        label = tk.Label(featured, textvariable=variable, bg=_SURF2,
+                         fg=_ACCENT, font=("Segoe UI", 17, "bold"),
+                         anchor="w", wraplength=290, justify="left")
+        label.pack(fill="x", padx=12, pady=(0, 12))
+        featured.pack(fill="x", padx=18, pady=(4, 8), before=card.winfo_children()[0])
 
-        _cap(dist_charts, "Bit-position frequency % (first 64 positions)").pack(
-            anchor="w")
-        self._bit_chart = _BarChart(dist_charts, 420, 110)
-        self._bit_chart.pack(fill="x", pady=(2, 8))
-
-        _cap(dist_charts, "Byte-value group counts (16 groups of 16 byte values)").pack(
-            anchor="w")
-        self._byte_chart = _BarChart(dist_charts, 420, 110)
-        self._byte_chart.pack(fill="x", pady=(2, 4))
-
-        self._dist_note = tk.Label(
-            body, text="", bg=_BG, fg=_SUB, font=_FCAP,
-            wraplength=820, justify="left")
-        self._dist_note.pack(anchor="w", padx=22, pady=(0, 16))
+    def _layout_checks(self, event):
+        columns = 3 if event.width >= 1020 else 1
+        for index in range(3):
+            self._checks.columnconfigure(index, weight=1 if index < columns else 0,
+                                         uniform="checks")
+        for index, card in enumerate(self._checks.winfo_children()):
+            card.grid_configure(row=index // columns, column=index % columns)
 
     @staticmethod
     def _section(parent: tk.Widget, title: str,
-                 subtitle: str = "") -> tk.Frame:
+                 subtitle: str = "", column=None) -> tk.Frame:
         """Create a titled card section and return its inner frame."""
-        wrapper = tk.Frame(parent, bg=_BG)
-        wrapper.pack(fill="x", padx=20, pady=(10, 0))
+        wrapper = _card(parent)
+        if column is None:
+            wrapper.pack(fill="x", padx=20, pady=(12, 0))
+        else:
+            wrapper.grid(row=0, column=column, sticky="nsew", padx=6, pady=8)
 
-        header = tk.Frame(wrapper, bg=_BORDER, height=1)
-        header.pack(fill="x", pady=(0, 6))
-
-        tk.Label(wrapper, text=title, bg=_BG, fg=_TEXT,
-                 font=_FH2).pack(anchor="w")
+        tk.Frame(wrapper, bg=_ACCENT, height=3).pack(fill="x")
+        tk.Label(wrapper, text=title, bg=_SURF, fg=_TEXT,
+                 font=_FH2).pack(anchor="w", padx=18, pady=(16, 4))
         if subtitle:
-            tk.Label(wrapper, text=subtitle, bg=_BG, fg=_SUB, font=_FCAP,
-                     wraplength=820, justify="left").pack(anchor="w", pady=(1, 4))
+            tk.Label(wrapper, text=subtitle, bg=_SURF, fg=_SUB, font=_FCAP,
+                     wraplength=290 if column is not None else 820,
+                     justify="left").pack(anchor="w", padx=18, pady=(0, 12))
 
-        card = _card(wrapper)
-        card.pack(fill="x", pady=(4, 0))
+        card = tk.Frame(wrapper, bg=_SURF)
+        card.pack(fill="both", expand=True, pady=(0, 16))
         return card
 
     # ── actions ───────────────────────────────────────────────────────────────
@@ -578,7 +548,7 @@ class FileAnalysisTab(tk.Frame):
         path = filedialog.askopenfilename(title="Select a file to analyse")
         if path:
             self._path_var.set(path)
-            self._status_var.set("File selected — click 'Hash & Analyse' to run all tests")
+            self._status_var.set("File selected — click 'Analyze File' to begin")
 
     def _start(self):
         if self._busy:
@@ -593,6 +563,9 @@ class FileAnalysisTab(tk.Frame):
             return
 
         self._file_path = path
+        self._run_mode = self._MODE_LABELS.get(
+            self._mode_var.get(), "optimized"
+        )
         self._busy = True
         self._hash_btn.configure(state="disabled")
         self._prog.pack(pady=6)
@@ -600,6 +573,9 @@ class FileAnalysisTab(tk.Frame):
 
         # reset all result fields
         self._digest_var.set("Hashing…")
+        self._perf_note_var.set(
+            "Preparing the authoritative digest and RAM-only benchmark..."
+        )
         for v in self._mv.values():
             v.set("…")
         for v in self._av.values():
@@ -608,12 +584,12 @@ class FileAnalysisTab(tk.Frame):
             v.set("…")
         for v in self._dist.values():
             v.set("…")
-        self._av_note.configure(text="")
-        self._col_note.configure(text="")
-        self._dist_note.configure(text="")
-        self._av_chart.delete("all")
-        self._bit_chart.delete("all")
-        self._byte_chart.delete("all")
+        self._av_result_var.set("Running sensitivity check…")
+        self._col_result_var.set("Waiting for sensitivity check")
+        self._dist_result_var.set("Waiting for duplicate-hash screen")
+        self._av_result_label.configure(fg=_SUB)
+        self._col_result_label.configure(fg=_SUB)
+        self._dist_result_label.configure(fg=_SUB)
 
         self._status_var.set("Running — hashing file…")
         threading.Thread(target=self._worker, daemon=True).start()
@@ -621,30 +597,96 @@ class FileAnalysisTab(tk.Frame):
     def _worker(self):
         path = self._file_path
         try:
-            # ── Step 1: Hash with optimized engine ──────────────────────────
-            workload = "latency" if self._mode_var.get() == "baseline" else "balanced"
-            result = hash_file(path, workload=workload)
-            if result.status != "ok":
-                raise RuntimeError(result.error or "hashing failed")
-            digest = result.digest
-            self.after(0, self._show_hash, result)
+            file_path = Path(path)
+            initial = file_path.stat()
+            threads = 1 if self._run_mode == "baseline" else physical_cpu_count()
+            memory_limit = recommended_memory_benchmark_limit()
 
-            # ── Step 2: Read file bytes (capped at 4 MB for in-memory tests) ─
+            # All file I/O happens outside the benchmark timer. A complete
+            # snapshot supplies the authoritative digest; oversized evidence
+            # gets a separate full-file pass plus a labelled RAM sample.
+            self.after(
+                0,
+                self._status_var.set,
+                "Running — loading benchmark data into RAM (not timed)…",
+            )
+            try:
+                snapshot = load_file_snapshot(path, max_bytes=memory_limit)
+            except MemoryError:
+                fallback_limit = min(int(initial.st_size), 64 * MIB)
+                snapshot = load_file_snapshot(path, max_bytes=fallback_limit)
+
+            if snapshot.complete:
+                digest = ""
+            else:
+                self.after(
+                    0,
+                    self._status_var.set,
+                    "Running — computing authoritative full-file digest…",
+                )
+                file_result = hash_file(
+                    path,
+                    threads=threads,
+                    expected_size=int(initial.st_size),
+                    workload="balanced",
+                )
+                if file_result.status != "ok":
+                    raise RuntimeError(file_result.error or "hashing failed")
+                digest = file_result.digest
+
+            self.after(
+                0,
+                self._status_var.set,
+                "Running — measuring RAM-only BLAKE3 throughput…",
+            )
+            benchmark = benchmark_memory(
+                snapshot.data,
+                threads=threads,
+                repeats=self._BENCHMARK_REPEATS,
+                warmups=self._BENCHMARK_WARMUPS,
+            )
+            if snapshot.complete:
+                digest = benchmark.digest
+
+            final = file_path.stat()
+            if (
+                int(final.st_size) != int(initial.st_size)
+                or int(final.st_mtime_ns) != int(initial.st_mtime_ns)
+                or (
+                    getattr(initial, "st_ino", 0)
+                    and getattr(final, "st_ino", 0)
+                    and initial.st_ino != final.st_ino
+                )
+            ):
+                raise RuntimeError("The evidence file changed during analysis")
+
+            self.after(0, self._show_hash, digest, benchmark, snapshot)
+
+            # Reuse the RAM snapshot for the validation diagnostics.
             self.after(0, self._status_var.set, "Running — avalanche effect test…")
-            data = _read_file_bytes(path, max_bytes=4 * 1024 * 1024)
+            data = bytes(memoryview(snapshot.data)[:4 * MIB])
+            diagnostic_scope = (
+                "entire file"
+                if int(initial.st_size) <= 4 * MIB
+                else "first 4 MiB analysis sample"
+            )
+            del snapshot
 
             # ── Step 3: Avalanche ────────────────────────────────────────────
             av = _run_avalanche(data, samples=self._AVALANCHE_SAMPLES)
+            av["scope"] = diagnostic_scope
             self.after(0, self._show_avalanche, av)
 
             # ── Step 4: Collision ────────────────────────────────────────────
-            self.after(0, self._status_var.set, "Running — collision resistance check…")
-            col = _run_collision(digest, data, n_variants=self._COLLISION_VARIANTS)
+            self.after(0, self._status_var.set, "Running — duplicate-hash screening…")
+            col = _run_collision(data, n_variants=self._COLLISION_VARIANTS)
+            col["scope"] = diagnostic_scope
+            distribution_digests = col.pop("digests")
             self.after(0, self._show_collision, col)
 
             # ── Step 5: Distribution ─────────────────────────────────────────
-            self.after(0, self._status_var.set, "Running — hash distribution analysis…")
-            dist = _run_distribution(digest)
+            self.after(0, self._status_var.set, "Running — output-bit balance check…")
+            dist = _run_distribution(distribution_digests)
             self.after(0, self._show_distribution, dist)
 
             self.after(0, self._done)
@@ -654,61 +696,93 @@ class FileAnalysisTab(tk.Frame):
 
     # ── result renderers ──────────────────────────────────────────────────────
 
-    def _show_hash(self, r):
-        self._digest_var.set(r.digest)
-        self._mv["elapsed"].set(f"{r.elapsed_ms / 1000:.4f} s")
-        self._mv["throughput"].set(f"{r.throughput_mb_s:.2f} MB/s")
-        self._mv["simd"].set(r.simd_tier)
-        self._mv["threads"].set(str(r.threads_used))
+    def _show_hash(self, digest, benchmark, snapshot):
+        self._digest_var.set(digest)
+        self._mv["elapsed"].set(f"{benchmark.median_elapsed_ms / 1000:.4f} s")
+        self._mv["throughput"].set(
+            f"{benchmark.median_throughput_mib_s:.2f} MiB/s"
+        )
+        self._mv["simd"].set(detected_simd_tier())
+        self._mv["threads"].set(str(benchmark.threads_used))
+
+        loaded_mib = snapshot.bytes_loaded / MIB
+        total_mib = snapshot.file_size / MIB
+        if snapshot.complete:
+            scope = f"complete {loaded_mib:.1f} MiB evidence snapshot"
+        else:
+            scope = (
+                f"first {loaded_mib:.1f} MiB of {total_mib:.1f} MiB; "
+                "the full-file digest was computed separately"
+            )
+        self._perf_note_var.set(
+            f"RAM-only median of {benchmark.repeats} trials after "
+            f"{benchmark.warmups} warm-ups; {scope}. File loading is excluded. "
+            f"Observed range: {benchmark.min_throughput_mib_s:.2f}–"
+            f"{benchmark.max_throughput_mib_s:.2f} MiB/s."
+        )
 
     def _show_avalanche(self, r: Dict[str, Any]):
+        if r.get("error"):
+            self._av_result_var.set("NOT APPLICABLE — an empty file has no bit to flip")
+            self._av_result_label.configure(fg=_YELLOW)
+            self._av["samples"].set("0")
+            self._av["average"].set("not available")
+            self._av["expected"].set("about 128 of 256 bits (50%)")
+            self._av["range"].set("not available")
+            self._av["scope"].set(r.get("scope", "empty file"))
+            return
+
         passed = r.get("passed", False)
-        self._av["status"].set("PASSED" if passed else "FAILED")
+        self._av_result_var.set(
+            "Expected sensitivity observed"
+            if passed else
+            "Outside the expected range"
+        )
+        self._av_result_label.configure(fg=_GREEN if passed else _YELLOW)
         self._av["samples"].set(str(r.get("samples", "—")))
-        self._av["mean"].set(f"{r['mean']:.3f} / 256")
-        self._av["mean_pct"].set(f"{r['mean_pct']:.2f} %")
-        self._av["stddev"].set(f"+/- {r['stddev']:.3f} bits")
-        self._av["minimum"].set(str(r["minimum"]))
-        self._av["maximum"].set(str(r["maximum"]))
-        self._av["expected"].set("128 bits (50 %)")
-        self._av_chart.draw(
-            r["buckets"], r["bucket_labels"],
-            color=_GREEN if passed else _RED,
-            title="Hamming-distance histogram (bit-flip samples on your file)")
-        self._av_note.configure(text=r.get("note", ""),
-                                fg=_GREEN if passed else _RED)
+        self._av["average"].set(
+            f"{r['mean']:.1f} of 256 bits ({r['mean_pct']:.2f}%)"
+        )
+        self._av["expected"].set("about 128 of 256 bits (50%)")
+        self._av["range"].set(
+            f"{r['minimum']}–{r['maximum']} changed bits"
+        )
+        self._av["scope"].set(r.get("scope", "analysis sample"))
 
     def _show_collision(self, r: Dict[str, Any]):
         passed = r.get("passed", False)
-        self._col["status"].set("PASSED — no collisions" if passed else "FAILED")
-        self._col["variants"].set(str(r["variants_tested"]))
+        self._col_result_var.set(
+            "No duplicate hashes observed"
+            if passed else
+            "Duplicate or inconsistent result detected"
+        )
+        self._col_result_label.configure(fg=_GREEN if passed else _RED)
+        self._col["inputs"].set(
+            f"{r['inputs_tested']} (original + {r['variants_tested']} modified)"
+        )
         n_col = r["collisions"]
         n_inc = r["inconsistent"]
         self._col["collisions"].set(
-            f"{n_col}  ({'none — digest is unique' if n_col == 0 else 'COLLISION FOUND'})")
+            f"{n_col} observed")
         self._col["threading"].set(
-            f"{'Yes — identical results' if n_inc == 0 else f'No — {n_inc} mismatches'}")
-        self._col_note.configure(text=r.get("note", ""),
-                                 fg=_GREEN if passed else _RED)
+            f"{'consistent results' if n_inc == 0 else f'{n_inc} mismatches'}")
+        self._col["scope"].set(r.get("scope", "analysis sample"))
 
     def _show_distribution(self, r: Dict[str, Any]):
         passed = r.get("passed", False)
-        self._dist["status"].set("Uniform" if passed else "Skewed — check values")
-        self._dist["bits"].set("256 (32-byte digest)")
-        self._dist["bits_set"].set(str(r["bits_set"]))
-        self._dist["freq"].set(f"{r['bit_freq_pct']:.2f} %")
-        self._dist["expected"].set("~50.00 %")
-
-        self._bit_chart.draw(
-            r["bit_pcts_64"], labels=None,
-            color=_ACCENT, ref_line=50.0,
-            title="")
-        self._byte_chart.draw(
-            r["byte_groups"], labels=r["byte_group_labels"],
-            color=_ACCENT2,
-            title="")
-        self._dist_note.configure(text=r.get("note", ""),
-                                  fg=_GREEN if passed else _YELLOW)
+        self._dist_result_var.set(
+            "Output bits are balanced"
+            if passed else
+            "Outside the expected balance range"
+        )
+        self._dist_result_label.configure(fg=_GREEN if passed else _YELLOW)
+        self._dist["digests"].set(str(r["digests_tested"]))
+        self._dist["total_bits"].set(f"{r['total_bits']:,}")
+        self._dist["counts"].set(
+            f"{r['bits_set']:,} ones / {r['bits_clear']:,} zeros"
+        )
+        self._dist["freq"].set(f"{r['bit_freq_pct']:.2f}% ones")
+        self._dist["expected"].set("approximately 50% ones and 50% zeros")
 
     def _done(self):
         self._busy = False
@@ -780,19 +854,30 @@ class BenchmarkTab(tk.Frame):
 
         tf = tk.Frame(res_card, bg=_SURF)
         tf.pack(fill="both", expand=True, padx=14, pady=(0, 12))
-        self._text = tk.Text(tf, bg=_SURF2, fg=_TEXT, font=_FMON,
-                             relief="flat", bd=0, wrap="none")
-        sb = ttk.Scrollbar(tf, orient="vertical", command=self._text.yview)
-        self._text.configure(yscrollcommand=sb.set)
+        self._benchmark_note = tk.StringVar(value="Choose a folder to compare hashing performance.")
+        tk.Label(tf, textvariable=self._benchmark_note, bg=_SURF,
+                 fg=_SUB, font=_FBOD, anchor="w", justify="left",
+                 wraplength=820).pack(fill="x", pady=(4, 16))
+        table_frame = tk.Frame(tf, bg=_SURF)
+        table_frame.pack(fill="both", expand=True)
+        columns = ("category", "algorithm", "speed", "time", "runs")
+        self._table = ttk.Treeview(table_frame, columns=columns, show="headings")
+        for key, heading, width in zip(columns,
+                ("File category", "Algorithm", "Speed (MiB/s)", "Time (ms)", "Runs"),
+                (180, 220, 160, 140, 80)):
+            self._table.heading(key, text=heading)
+            self._table.column(key, width=width, minwidth=70,
+                               anchor="w" if key in ("category", "algorithm") else "e")
+        self._table.tag_configure("alternate", background=_SURF2)
+        sb = ttk.Scrollbar(table_frame, orient="vertical", command=self._table.yview)
+        self._table.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
-        self._text.pack(fill="both", expand=True)
+        self._table.pack(fill="both", expand=True)
         self._set_text("No benchmark run yet.\nClick 'Select Folder & Run' to start.")
 
     def _set_text(self, t: str):
-        self._text.configure(state="normal")
-        self._text.delete("1.0", "end")
-        self._text.insert("1.0", t)
-        self._text.configure(state="disabled")
+        self._benchmark_note.set(t)
+        self._table.delete(*self._table.get_children())
 
     def _start(self):
         if self._busy:
@@ -833,24 +918,16 @@ class BenchmarkTab(tk.Frame):
 
     def _on_success(self, summary, csv_p, json_p, n, reps):
         self._busy = False
-        simd = detected_simd_tier()
-        lines = [
-            f"Files processed : {n}",
-            f"Repeats / file  : {reps}",
-            f"SIMD tier       : {simd}",
-            "",
-            f"{'Category':<16} {'Algorithm':<16} {'Median MB/s':>12} {'Median ms':>10} {'Runs':>6}",
-            "─" * 64,
-        ]
-        for e in summary:
-            lines.append(
-                f"{e['category']:<16} {e['algorithm']:<16}"
-                f" {e['median_throughput_mb_s']:>12.2f}"
-                f" {e['median_elapsed_ms']:>10.1f}"
-                f" {e['runs']:>6}"
-            )
-        lines += ["", f"CSV  -> {csv_p}", f"JSON -> {json_p}"]
-        self._set_text("\n".join(lines))
+        self._set_text(
+            f"{n} files · {reps} trials per file · Median results\n"
+            f"CSV: {csv_p}\nJSON: {json_p}"
+        )
+        for index, entry in enumerate(summary):
+            self._table.insert("", "end", values=(
+                entry["category"], entry["algorithm"],
+                f"{entry['median_throughput_mb_s']:,.2f}",
+                f"{entry['median_elapsed_ms']:,.1f}", entry["runs"],
+            ), tags=("alternate",) if index % 2 else ())
         self._status_var.set("Benchmark complete")
 
     def _on_error(self, msg: str):
@@ -868,12 +945,14 @@ class Blake3App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("BLAKE3 Forensic Toolkit")
-        self.geometry("920x780")
+        width = min(1240, self.winfo_screenwidth() - 80)
+        height = min(900, self.winfo_screenheight() - 100)
+        self.geometry(f"{width}x{height}")
         self.minsize(800, 600)
         self.configure(bg=_BG)
         self._apply_styles()
         self._status_var = tk.StringVar(
-            value=f"Ready  |  SIMD: {detected_simd_tier()}")
+            value="Ready · Select an evidence file to begin")
         self._build_header()
         self._build_tabs()
         self._build_status()
@@ -884,10 +963,16 @@ class Blake3App(tk.Tk):
         s.configure(".", background=_BG, foreground=_TEXT, font=_FBOD)
         s.configure("TNotebook", background=_BG, borderwidth=0)
         s.configure("TNotebook.Tab", background=_SURF, foreground=_SUB,
-                    padding=[16, 8], font=("Segoe UI", 10), borderwidth=0)
+                    padding=[24, 12], font=("Segoe UI", 10, "bold"), borderwidth=0)
         s.map("TNotebook.Tab",
               background=[("selected", _SURF2)],
-              foreground=[("selected", _TEXT)])
+              foreground=[("selected", _ACCENT)])
+        s.configure("Treeview", background=_SURF, fieldbackground=_SURF,
+                    foreground=_TEXT, rowheight=38, borderwidth=0, font=_FBOD)
+        s.configure("Treeview.Heading", background=_SURF2, foreground=_SUB,
+                    font=_FH3, padding=[12, 10], relief="flat")
+        s.map("Treeview", background=[("selected", _ACCENT)],
+              foreground=[("selected", "#ffffff")])
         s.configure("TScrollbar", background=_SURF2,
                     troughcolor=_SURF, arrowcolor=_SUB)
         s.configure("TCombobox",
@@ -901,22 +986,23 @@ class Blake3App(tk.Tk):
                     troughcolor=_SURF2, background=_ACCENT, thickness=5)
 
     def _build_header(self):
-        hdr = tk.Frame(self, bg=_SURF, height=52,
+        hdr = tk.Frame(self, bg=_SURF, height=72,
                        highlightbackground=_BORDER, highlightthickness=1)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
 
-        dot = tk.Canvas(hdr, width=30, height=30, bg=_SURF, highlightthickness=0)
-        dot.create_oval(3, 3, 27, 27, fill=_ACCENT, outline="")
-        dot.create_oval(9, 9, 21, 21, fill=_ACCENT2, outline="")
-        dot.pack(side="left", padx=(14, 0), pady=11)
+        dot = tk.Canvas(hdr, width=40, height=40, bg=_SURF, highlightthickness=0)
+        dot.create_rectangle(0, 0, 40, 40, fill=_ACCENT, outline="")
+        dot.create_text(20, 20, text="B3", fill="#ffffff",
+                        font=("Segoe UI", 13, "bold"))
+        dot.pack(side="left", padx=(24, 8), pady=16)
 
         tk.Label(hdr, text="BLAKE3", bg=_SURF, fg=_TEXT,
                  font=("Segoe UI", 13, "bold")).pack(side="left", padx=(6, 0))
         tk.Label(hdr, text="Forensic Toolkit", bg=_SURF, fg=_SUB,
                  font=("Segoe UI", 10)).pack(side="left", padx=(5, 0))
 
-        _badge(hdr, detected_simd_tier(), _ACCENT2).pack(
+        _badge(hdr, "FORENSIC ANALYSIS", _ACCENT).pack(
             side="right", padx=14, pady=14)
 
     def _build_tabs(self):
@@ -938,7 +1024,7 @@ class Blake3App(tk.Tk):
                  bg=_SURF, fg=_SUB, font=_FCAP,
                  anchor="w").pack(side="left", padx=14, pady=3)
         tk.Label(bar, text="Optimized BLAKE3  |  Native C extension",
-                 bg=_SURF, fg=_BORDER, font=_FCAP,
+                  bg=_SURF, fg=_SUB, font=_FCAP,
                  anchor="e").pack(side="right", padx=14, pady=3)
 
 

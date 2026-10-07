@@ -106,12 +106,25 @@ python blake3_validation.py
 5. Enable **Optimized BLAKE3 Hasher** during ingest.
 
 The module hashes the complete data source and every eligible file, including
-zero-byte files. To avoid flooding Autopsy's Blackboard, it creates **BLAKE3
-Hash (Optimized v4)** artifacts for the complete data source and sampled file
-comparisons; all optimized per-file results remain in the HTML/JSON audit log.
-Set `BLAKE3_POST_ALL_FILE_ARTIFACTS=1` if laboratory policy requires one
-Blackboard artifact per readable file. After Autopsy fires
-its data-source-analysis-completed event, the HTML report is registered under
+zero-byte files. By default it creates **BLAKE3 Hash (Optimized)** artifacts for
+the complete data source and every successfully hashed file. Set
+`BLAKE3_POST_ALL_FILE_ARTIFACTS=0` to restrict file artifacts to comparison
+results when sampled comparison mode is enabled; all optimized per-file
+results remain in the HTML/JSON audit log.
+
+Build `2026-10-08-deferred-artifact-publishing-r1` queues artifacts in memory
+during ingest and publishes them only after the matching successful
+data-source-analysis-completed event (or matching job-completed fallback).
+This avoids the observed Autopsy 4.22.1 lock cycle between `newArtifact()` and
+image-import finalization. Artifact publishing then runs on a background
+thread; the report is generated after that queue is drained. Consequently,
+hash artifacts and the report appear after analysis, not progressively during
+import. Publication failures are recorded separately in the JSON audit's
+`artifact_errors`; they do not invalidate completed hash measurements.
+Restart Autopsy after replacing the installed Python module. An already
+deadlocked JVM cannot load this fix or recover merely by replacing the file.
+
+After artifact publishing completes, the HTML report is registered under
 **Reports** and an **Open Report / OK** dialog is displayed automatically.
 
 It independently computes Baseline BLAKE3, MD5, SHA-1, and SHA-256 for the
