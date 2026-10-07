@@ -7,7 +7,7 @@ to THAT specific file — not to synthetic random data.
 Tabs
 ----
 1. File Analysis   — hash the file + avalanche / collision / distribution inline
-2. Benchmark       — compare BLAKE3 vs MD5/SHA-1/SHA-256 across a folder
+2. Benchmark       — compare optimized/baseline BLAKE3 vs MD5/SHA-1/SHA-256
 """
 from __future__ import annotations
 
@@ -826,10 +826,10 @@ class BenchmarkTab(tk.Frame):
     def _build(self):
         pad = dict(padx=20, pady=8)
 
-        tk.Label(self, text="Benchmark", bg=_BG, fg=_TEXT,
+        tk.Label(self, text="Hash Performance Benchmark", bg=_BG, fg=_TEXT,
                  font=_FH1).pack(anchor="w", padx=20, pady=(18, 4))
         tk.Label(self,
-                 text="Compare BLAKE3 (optimized/baseline) vs MD5, SHA-1, SHA-256 across a folder.",
+                 text="Compare optimized BLAKE3, baseline BLAKE3, MD5, SHA-1, and SHA-256 on the same file.",
                  bg=_BG, fg=_SUB, font=_FBOD).pack(anchor="w", padx=20, pady=(0, 10))
 
         ctrl_card = _card(self)
@@ -837,102 +837,183 @@ class BenchmarkTab(tk.Frame):
         ctrl = tk.Frame(ctrl_card, bg=_SURF)
         ctrl.pack(fill="x", padx=14, pady=12)
 
-        tk.Label(ctrl, text="Repeats / file:", bg=_SURF, fg=_SUB,
+        tk.Label(ctrl, text="Measured trials per profile", bg=_SURF, fg=_SUB,
                  font=_FBOD).pack(side="left")
-        self._rep_var = tk.IntVar(value=3)
-        ttk.Spinbox(ctrl, from_=1, to=20, width=5,
+        self._rep_var = tk.IntVar(value=5)
+        ttk.Spinbox(ctrl, from_=5, to=30, increment=5, width=5,
                     textvariable=self._rep_var).pack(side="left", padx=(8, 20))
-        tk.Button(ctrl, text="Select Folder & Run", command=self._start,
+        tk.Button(ctrl, text="Select File and Run", command=self._start,
                   bg=_ACCENT, fg="#fff", relief="flat", font=_FH3,
                   padx=18, pady=6, cursor="hand2",
                   activebackground=_ACCENT2, activeforeground="#fff",
                   ).pack(side="left")
+        tk.Label(ctrl, text="1 warm-up per profile is automatic and excluded",
+                 bg=_SURF, fg=_SUB, font=_FCAP).pack(side="left", padx=(14, 0))
 
         res_card = _card(self)
         res_card.pack(fill="both", expand=True, **pad)
-        _cap(res_card, "RESULTS").pack(anchor="w", padx=14, pady=(10, 2))
+        _cap(res_card, "BENCHMARK RESULTS").pack(anchor="w", padx=14, pady=(10, 2))
 
         tf = tk.Frame(res_card, bg=_SURF)
         tf.pack(fill="both", expand=True, padx=14, pady=(0, 12))
-        self._benchmark_note = tk.StringVar(value="Choose a folder to compare hashing performance.")
+        self._result_title_var = tk.StringVar(value="Ready to benchmark")
+        tk.Label(tf, textvariable=self._result_title_var, bg=_SURF,
+                 fg=_TEXT, font=_FH2, anchor="w", justify="left",
+                 wraplength=1040).pack(fill="x", pady=(4, 2))
+        self._benchmark_note = tk.StringVar(
+            value="Select one file. Each profile receives one warm-up and five or more measured trials."
+        )
         tk.Label(tf, textvariable=self._benchmark_note, bg=_SURF,
                  fg=_SUB, font=_FBOD, anchor="w", justify="left",
-                 wraplength=820).pack(fill="x", pady=(4, 16))
+                 wraplength=1040).pack(fill="x", pady=(0, 12))
         table_frame = tk.Frame(tf, bg=_SURF)
         table_frame.pack(fill="both", expand=True)
-        columns = ("category", "algorithm", "speed", "time", "runs")
+        columns = ("algorithm", "time", "speed", "cpu", "memory", "optimization")
         self._table = ttk.Treeview(table_frame, columns=columns, show="headings")
         for key, heading, width in zip(columns,
-                ("File category", "Algorithm", "Speed (MiB/s)", "Time (ms)", "Runs"),
-                (180, 220, 160, 140, 80)):
+                ("Hash profile", "Median time (ms)", "Median throughput (MiB/s)",
+                 "Median CPU (%)", "Median peak RSS (MiB)",
+                 "Optimized BLAKE3 vs profile"),
+                (190, 165, 175, 165, 165, 205)):
             self._table.heading(key, text=heading)
             self._table.column(key, width=width, minwidth=70,
-                               anchor="w" if key in ("category", "algorithm") else "e")
+                               anchor="w" if key in ("algorithm", "optimization") else "e")
         self._table.tag_configure("alternate", background=_SURF2)
-        sb = ttk.Scrollbar(table_frame, orient="vertical", command=self._table.yview)
-        self._table.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
+        self._table.tag_configure("optimized", background="#ecfdf5", foreground=_ACCENT2)
+        self._table.tag_configure("baseline", background="#f1f5f9", foreground=_TEXT)
+        y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self._table.yview)
+        x_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self._table.xview)
+        self._table.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        y_scroll.pack(side="right", fill="y")
+        x_scroll.pack(side="bottom", fill="x")
         self._table.pack(fill="both", expand=True)
-        self._set_text("No benchmark run yet.\nClick 'Select Folder & Run' to start.")
+        self._metric_note_var = tk.StringVar(value=(
+            "Time and throughput are median values. CPU is normalized to total "
+            "logical-processor capacity. RSS is resident process memory. Time reduction = "
+            "(profile time − optimized time) / profile time × 100."
+        ))
+        tk.Label(tf, textvariable=self._metric_note_var, bg=_SURF, fg=_SUB,
+                 font=_FCAP, anchor="w", justify="left", wraplength=1040
+                 ).pack(fill="x", pady=(10, 2))
+        self._report_note_var = tk.StringVar(value="")
+        tk.Label(tf, textvariable=self._report_note_var, bg=_SURF, fg=_SUB,
+                 font=_FCAP, anchor="w", justify="left", wraplength=1040
+                 ).pack(fill="x", pady=(0, 2))
 
-    def _set_text(self, t: str):
-        self._benchmark_note.set(t)
+    def _set_result(self, title: str, detail: str, reports: str = ""):
+        self._result_title_var.set(title)
+        self._benchmark_note.set(detail)
+        self._report_note_var.set(reports)
         self._table.delete(*self._table.get_children())
 
     def _start(self):
         if self._busy:
             messagebox.showinfo("Busy", "Please wait.")
             return
-        folder = filedialog.askdirectory(title="Select dataset folder")
-        if not folder:
+        path = filedialog.askopenfilename(title="Select a file to benchmark")
+        if not path:
             return
         try:
             repeats = int(self._rep_var.get())
         except (TypeError, ValueError):
-            messagebox.showerror("Error", "Repeats must be a whole number.")
+            messagebox.showerror("Invalid trial count", "Trials must be a whole number.")
             return
-        if repeats < 1:
-            messagebox.showerror("Error", "Repeats must be >= 1.")
+        if repeats < 5 or repeats % 5:
+            messagebox.showerror(
+                "Invalid trial count",
+                "Use 5, 10, 15, 20, 25, or 30 trials for balanced execution order.",
+            )
             return
         self._busy = True
-        self._status_var.set("Benchmarking…")
-        self._set_text("Running benchmark, please wait…")
-        threading.Thread(target=self._worker, args=(folder, repeats),
+        self._status_var.set("Benchmark running…")
+        self._set_result(
+            "Benchmark in progress",
+            f"Running 1 excluded warm-up and {repeats} measured trials per profile…",
+        )
+        threading.Thread(target=self._worker, args=(path, repeats),
                          daemon=True).start()
 
-    def _worker(self, folder: str, repeats: int):
+    def _worker(self, path: str, repeats: int):
         try:
-            files = [str(p) for p in Path(folder).rglob("*") if p.is_file()]
-            if not files:
-                raise ValueError("No files found in the selected folder.")
-            report   = benchmark_files(files, rounds=repeats)
+            report   = benchmark_files([path], rounds=repeats, warmups=1)
             ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_json = os.path.join(folder, f"blake3_benchmark_{ts}.json")
-            out_csv  = os.path.join(folder, f"blake3_benchmark_{ts}.csv")
+            output_folder = str(Path(path).resolve().parent)
+            out_json = os.path.join(output_folder, f"blake3_benchmark_{ts}.json")
+            out_csv  = os.path.join(output_folder, f"blake3_benchmark_{ts}.csv")
             Path(out_json).write_text(json.dumps(report, indent=2), encoding="utf-8")
             _write_csv(out_csv, report["runs"])
-            self.after(0, self._on_success, report["summary"],
-                       out_csv, out_json, len(files), repeats)
+            self.after(0, self._on_success, report,
+                       out_csv, out_json, path, repeats)
         except Exception as exc:
             self.after(0, self._on_error, str(exc))
 
-    def _on_success(self, summary, csv_p, json_p, n, reps):
+    def _on_success(self, report, csv_p, json_p, path, reps):
         self._busy = False
-        self._set_text(
-            f"{n} files · {reps} trials per file · Median results\n"
-            f"CSV: {csv_p}\nJSON: {json_p}"
+        summary = report["summary"]
+        optimized = next(
+            (row for row in summary if row["algorithm"] == "BLAKE3 (Optimized)"), None
+        )
+        percent = optimized.get("optimization_percent") if optimized else None
+        speedup = optimized.get("speedup_vs_baseline") if optimized else None
+        if percent is None:
+            result_title = "Optimization result unavailable"
+        elif percent >= 0:
+            result_title = (
+                f"Optimized BLAKE3 reduced median time by {percent:.2f}% "
+                f"({speedup:.2f}× faster)"
+            )
+        else:
+            result_title = (
+                f"Optimized BLAKE3 was {abs(percent):.2f}% slower than baseline "
+                f"({speedup:.2f}× baseline speed)"
+            )
+        detail = (
+            f"File: {Path(path).name}  •  Measured trials: {reps} per profile  •  "
+            "Warm-ups: 1 excluded  •  Cache mode: warm"
+        )
+        warnings = report.get("warnings", [])
+        if warnings:
+            detail += "\nMeasurement note: " + " ".join(warnings)
+        self._set_result(
+            result_title,
+            detail,
+            f"Reports — CSV: {csv_p}  •  JSON: {json_p}",
         )
         for index, entry in enumerate(summary):
+            comparison_percent = entry.get("optimized_time_change_percent")
+            if entry["algorithm"] == "BLAKE3 (Optimized)":
+                optimization = "Reference"
+            elif comparison_percent is not None:
+                optimization = (
+                    f"{comparison_percent:.2f}% reduction"
+                    if comparison_percent >= 0
+                    else f"{abs(comparison_percent):.2f}% increase"
+                )
+            else:
+                optimization = "N/A"
+            cpu = entry.get("median_cpu_utilization_percent")
+            memory = entry.get("median_peak_rss_mb")
+            if entry["algorithm"] == "BLAKE3 (Optimized)":
+                tags = ("optimized",)
+            elif entry["algorithm"] == "BLAKE3 (Baseline)":
+                tags = ("baseline",)
+            else:
+                tags = ("alternate",) if index % 2 else ()
             self._table.insert("", "end", values=(
-                entry["category"], entry["algorithm"],
+                entry["algorithm"],
+                f"{entry['median_elapsed_ms']:,.3f}",
                 f"{entry['median_throughput_mb_s']:,.2f}",
-                f"{entry['median_elapsed_ms']:,.1f}", entry["runs"],
-            ), tags=("alternate",) if index % 2 else ())
-        self._status_var.set("Benchmark complete")
+                f"{cpu:,.2f}" if cpu is not None else "N/A",
+                f"{memory:,.2f}" if memory is not None else "N/A",
+                optimization,
+            ), tags=tags)
+        self._status_var.set(
+            "Benchmark complete · Digests verified · Median results shown"
+        )
 
     def _on_error(self, msg: str):
         self._busy = False
-        self._set_text(f"Benchmark failed:\n{msg}")
+        self._set_result("Benchmark failed", msg)
         self._status_var.set("Benchmark failed")
         messagebox.showerror("Benchmark error", msg)
 
