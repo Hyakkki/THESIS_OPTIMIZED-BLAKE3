@@ -6,7 +6,8 @@ the official ``blake3`` native extension.  Splitting a file, hashing each part,
 and hashing the resulting digests is *not* equivalent to BLAKE3 and is never
 done here.
 
-The public API is ``hash_file()``, ``hash_stream()``, and ``hash_many()``.  The
+The public API is ``hash_file()``, ``hash_stream()``, ``hash_file_config()`` and
+``hash_small_files()``; everyday multi-file hashing lives in ``file_hashing.py``.  The
 ``--server`` mode is a persistent length-prefixed bridge for Autopsy/Jython:
 
     <ASCII byte count>\n<exactly that many raw bytes>
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import functools
 import hashlib
 import json
 import mmap
@@ -27,10 +29,10 @@ import statistics
 import sys
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Dict, List, Optional, Sequence, Tuple
 
 try:
     import blake3 as _blake3_module
@@ -49,7 +51,7 @@ except ImportError:  # Metrics still work, with a documented RSS fallback.
 MIB = 1024 * 1024
 # Below this threshold the native thread-pool startup cost outweighs any
 # benefit, so small files use a single thread.  Also controls the per-file
-# multithreading gate in select_policy() and hash_many().
+# multithreading gate in select_policy() and policy_for_config().
 # Override with BLAKE3_SMALL_FILE_LIMIT (bytes) for testing.
 SMALL_FILE_LIMIT = int(os.environ.get("BLAKE3_SMALL_FILE_LIMIT", str(32 * MIB)))
 MMAP_MIN_BYTES = 64 * MIB
@@ -60,6 +62,10 @@ KNOWN_VECTORS = {
     b"": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
     b"abc": "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
 }
+
+
+class OperationCancelled(Exception):
+    """Raised when a long-running operation is cancelled by the user."""
 
 
 @dataclass(frozen=True)
@@ -348,8 +354,13 @@ def _cpu_flags() -> set[str]:
     return set()
 
 
+@functools.lru_cache(maxsize=1)
 def detected_simd_tier() -> str:
-    """Report host capability; the native backend performs runtime dispatch."""
+    """Report host capability; the native backend performs runtime dispatch.
+
+    Cached: CPU feature detection (py-cpuinfo) takes over a second and the
+    answer cannot change while the process runs.
+    """
     machine = platform.machine().lower()
     flags = _cpu_flags()
     if "avx512f" in flags:
@@ -1028,76 +1039,6 @@ def hash_small_files(
             results.extend(_small_batch_worker(batch))
         return results
     return [_small_file_worker(path) for path in items]
-
-
-def _hash_file_worker(arguments: Tuple[str, bool, bool]) -> Dict[str, Any]:
-    path, allow_mmap, collect_metrics = arguments
-    # One native worker per process prevents N processes each spawning N threads.
-    return hash_file(
-        path,
-        threads=1,
-        allow_mmap=allow_mmap,
-        collect_metrics=collect_metrics,
-        workload="throughput",
-    ).to_dict()
-
-
-def hash_many(
-    paths: Iterable[os.PathLike[str] | str],
-    *,
-    workers: Optional[int] = None,
-    allow_mmap: bool = True,
-    collect_metrics: bool = True,
-) -> List[HashResult]:
-    """Hash independent files with a process pool, preserving input order.
-
-    A single file uses native tree parallelism.  Multiple small files stay in
-    process to avoid dispatch overhead.  Multiple >=16 MiB files use processes,
-    each with one native BLAKE3 worker, avoiding nested oversubscription.
-    """
-    normalized = [str(Path(path)) for path in paths]
-    if not normalized:
-        return []
-    if len(normalized) == 1:
-        return [hash_file(normalized[0], allow_mmap=allow_mmap, collect_metrics=collect_metrics)]
-
-    sizes = [os.path.getsize(path) for path in normalized]
-    large_indexes = [i for i, size in enumerate(sizes) if size >= SMALL_FILE_LIMIT]
-    results: List[Optional[HashResult]] = [None] * len(normalized)
-    for index, (path, size) in enumerate(zip(normalized, sizes)):
-        if size < SMALL_FILE_LIMIT:
-            results[index] = hash_file(
-                path, threads=1, allow_mmap=False, collect_metrics=collect_metrics
-            )
-
-    if large_indexes:
-        max_workers = max(1, min(workers or physical_cpu_count(), len(large_indexes)))
-        if max_workers == 1:
-            for index in large_indexes:
-                results[index] = hash_file(
-                    normalized[index],
-                    allow_mmap=allow_mmap,
-                    collect_metrics=collect_metrics,
-                )
-        else:
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        _hash_file_worker,
-                        (normalized[index], allow_mmap, collect_metrics),
-                    ): index
-                    for index in large_indexes
-                }
-                for future in as_completed(futures):
-                    index = futures[future]
-                    results[index] = HashResult(
-                        **{
-                            key: value
-                            for key, value in future.result().items()
-                            if key not in ("message", "threads_semantics")
-                        }
-                    )
-    return [result for result in results if result is not None]
 
 
 def self_test() -> Dict[str, Any]:

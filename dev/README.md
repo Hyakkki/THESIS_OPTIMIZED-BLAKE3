@@ -19,8 +19,6 @@ File Hashing in Digital Forensic Investigations.”**
   avalanche diagnostic, and empirical collision screen.
 - `tests/` — regression tests.
 - `build_sidecar.ps1` — reproducible PyInstaller build command.
-- `OptimizedBLAKE3Ingest.py` — inactive migration marker; it prevents the old
-  and new factories from both hashing the same files.
 
 The engine uses the official `blake3` native extension. Its backend performs
 standards-compliant BLAKE3 Merkle-tree parallelism and runtime SIMD dispatch.

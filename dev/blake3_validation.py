@@ -49,7 +49,6 @@ from blake3_reference import reference_derive_key, reference_hash, reference_key
 from optimized_blake3 import (
     BLAKE3_CONFIGS,
     EXPLORATORY_CONFIGS,
-    KNOWN_VECTORS,
     MIB,
     SMALL_FILE_LIMIT,
     _small_batch_worker,
@@ -76,12 +75,6 @@ LIMITATIONS = (
 )
 
 ProgressCallback = Optional[Callable[[str, float], None]]
-
-
-def hamming_distance(left: bytes, right: bytes) -> int:
-    if len(left) != len(right):
-        raise ValueError("digests must have equal length")
-    return sum((a ^ b).bit_count() for a, b in zip(left, right))
 
 
 def _vector_input(length: int) -> bytes:

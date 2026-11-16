@@ -32,6 +32,7 @@ exploratory configuration.
                         dev/dataset_tool.py             dataset generation, manifest, coverage
 3 Measurement & stats   dev/metrics.py                  formulas F1–F19, Wilcoxon, bootstrap, Cliff's δ, Holm
 4 Hashing engine        dev/optimized_blake3.py         policies, configurations, batching, process pool
+                        dev/file_hashing.py             everyday hashing, hash lists (b3sum format), re-checking
                         └─ blake3 (native Rust/C extension, runtime SIMD dispatch)
 Support                 dev/blake3_reference.py         independent pure-Python BLAKE3 (verification only)
                         dev/test_vectors/               official BLAKE3 test vectors
@@ -50,6 +51,7 @@ python main_app.py
 
 | Tab | Purpose |
 |---|---|
+| **Hash Files** (opens first) | Hash files or whole folders with the optimized engine (BLAKE3, optionally SHA-256/SHA-1/MD5); copy digests; check against an expected hash; save a `.b3` hash list (b3sum format) + CSV/JSON report; re-check files against a saved list |
 | Overview | Contributions, constants, architecture, suggested demonstration order |
 | File Analysis | Digest, in-memory speed, avalanche / strict avalanche criterion / bit balance / duplicate screen for one file |
 | Technique Benchmark | Large-file 2×2 experiment (adaptive buffer × multithreading) plus reference algorithms; speedup with 95 % CI, Holm-adjusted Wilcoxon p, Cliff's δ, factorial effects, chart, results per size tier |
@@ -78,6 +80,8 @@ The full plan and formulas are in `dev/metrics.py` and the Methodology tab.
 
 ```bash
 cd dev
+python file_hashing.py FILE_OR_FOLDER [...] [--extra sha256] [--save ../results]
+python file_hashing.py --check ../results/hashes_YYYYMMDD_HHMMSS.b3
 python dataset_tool.py sweep  ../digital_evidence_dataset/generated/size_sweep --max-size-mib 1024
 python dataset_tool.py small  ../digital_evidence_dataset/generated/small_files --count 2000
 python dataset_tool.py manifest ../digital_evidence_dataset

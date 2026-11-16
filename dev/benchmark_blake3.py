@@ -42,6 +42,7 @@ from optimized_blake3 import (
     DEFAULT_BATCH_SIZE,
     EXPLORATORY_CONFIGS,
     MIB,
+    OperationCancelled,
     REFERENCE_ALGORITHMS,
     SMALL_FILE_LIMIT,
     SMALL_FILE_MODES,
@@ -67,10 +68,9 @@ ProgressCallback = Optional[Callable[[str, float], None]]
 
 # Backward-compatible names.
 optimization_percent = metrics.percent_time_reduction
-evidence_category = classify_format
 
 
-class BenchmarkCancelled(Exception):
+class BenchmarkCancelled(OperationCancelled):
     """Raised when the caller's cancel event is set between executions."""
 
 
