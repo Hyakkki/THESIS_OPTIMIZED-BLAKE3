@@ -23,3 +23,6 @@ digital_evidence_dataset/*.e01
 # IDE
 .vscode/
 .idea/
+
+# Benchmark / verification results from the app
+results/

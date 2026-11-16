@@ -132,6 +132,58 @@ class HashingTests(unittest.TestCase):
         self.assertIn("baseline", result["profile"])
 
 
+class TechniqueConfigTests(unittest.TestCase):
+    def test_factor_levels_map_to_policies(self):
+        large = engine.SMALL_FILE_LIMIT + engine.MIB
+        policies = {c.key: engine.policy_for_config(c, large, threads=4)
+                    for c in engine.BLAKE3_CONFIGS}
+        self.assertEqual((policies["baseline"].chunk_size, policies["baseline"].max_threads),
+                         (engine.MIB, 1))
+        self.assertEqual(policies["buffer_only"].chunk_size, engine.adaptive_chunk_size(large))
+        self.assertEqual(policies["buffer_only"].max_threads, 1)
+        self.assertEqual(policies["threads_only"].chunk_size, engine.MIB)
+        self.assertEqual(policies["threads_only"].max_threads, 4)
+        self.assertEqual(policies["optimized"].max_threads, 4)
+        self.assertFalse(any(p.use_mmap for p in policies.values()))
+
+    def test_threads_never_apply_below_threshold(self):
+        policy = engine.policy_for_config(engine.CONFIGS_BY_KEY["optimized"],
+                                          engine.SMALL_FILE_LIMIT - 1, threads=8)
+        self.assertEqual(policy.max_threads, 1)
+
+    def test_all_configs_and_references_hash_correctly(self):
+        import hashlib
+        payload = os.urandom(engine.MIB + 333)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "x.bin")
+            path.write_bytes(payload)
+            for config in engine.BLAKE3_CONFIGS + engine.EXPLORATORY_CONFIGS:
+                self.assertEqual(engine.hash_file_config(path, config).digest,
+                                 blake3.blake3(payload).hexdigest())
+            for algorithm in ("md5", "sha1", "sha256"):
+                result = engine.hash_file_reference(path, algorithm)
+                self.assertEqual(result.digest, hashlib.new(algorithm, payload).hexdigest())
+                self.assertEqual(result.chunk_size, engine.MIB)
+
+    def test_small_file_modes_agree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for index in range(25):
+                path = Path(directory, "s%d" % index)
+                path.write_bytes(os.urandom(100 + index * 50))
+                paths.append(str(path))
+            expected = [(blake3.blake3(Path(p).read_bytes()).hexdigest(), os.path.getsize(p))
+                        for p in paths]
+            pool, startup = engine.make_worker_pool(2)
+            try:
+                for mode in engine.SMALL_FILE_MODES:
+                    self.assertEqual(engine.hash_small_files(paths, mode, pool=pool, batch_size=4),
+                                     expected, mode.key)
+            finally:
+                pool.shutdown()
+            self.assertGreater(startup, 0)
+
+
 class ValidationTests(unittest.TestCase):
     def test_deterministic_correctness(self):
         self.assertTrue(deterministic_correctness()["passed"])

@@ -399,26 +399,67 @@ def _windows_peak_rss_bytes() -> Optional[int]:
 
 
 class _MetricSampler:
-    """Low-frequency RSS sampling plus high-resolution wall/CPU deltas."""
+    """Low-frequency RSS sampling plus high-resolution wall/CPU deltas.
 
-    def __init__(self, enabled: bool = True) -> None:
+    With ``include_children=True`` CPU time and RSS cover the whole process
+    tree, which is required when work is dispatched to worker processes
+    (their CPU time is otherwise invisible to ``time.process_time``).
+    """
+
+    def __init__(self, enabled: bool = True, include_children: bool = False) -> None:
         self.enabled = enabled
+        self.include_children = bool(include_children and _psutil is not None)
         self.wall_start_ns = 0
         self.cpu_start = 0.0
         self.peak_rss = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._process = _psutil.Process(os.getpid()) if enabled and _psutil else None
+        if self.include_children and self._process is None:
+            self._process = _psutil.Process(os.getpid())
+
+    def _tree(self) -> List[Any]:
+        assert self._process is not None
+        members = [self._process]
+        if self.include_children:
+            try:
+                members.extend(self._process.children(recursive=True))
+            except Exception:
+                pass
+        return members
+
+    def _rss_now(self) -> int:
+        total = 0
+        for member in self._tree():
+            try:
+                total += int(member.memory_info().rss)
+            except Exception:
+                pass
+        return total
+
+    def _cpu_now(self) -> float:
+        if not self.include_children:
+            return time.process_time()
+        total = 0.0
+        for member in self._tree():
+            try:
+                times = member.cpu_times()
+                total += float(times.user) + float(times.system)
+            except Exception:
+                pass
+        return total
 
     def __enter__(self) -> "_MetricSampler":
-        if self._process is not None:
+        if self._process is not None and (self.enabled or self.include_children):
             try:
-                self.peak_rss = int(self._process.memory_info().rss)
-                self._thread = threading.Thread(target=self._sample, daemon=True)
-                self._thread.start()
+                self.peak_rss = self._rss_now()
+                if self.enabled:
+                    self._thread = threading.Thread(target=self._sample, daemon=True)
+                    self._thread.start()
             except Exception:
                 self._process = None
-        self.cpu_start = time.process_time()
+                self.include_children = False
+        self.cpu_start = self._cpu_now()
         self.wall_start_ns = time.perf_counter_ns()
         return self
 
@@ -426,19 +467,19 @@ class _MetricSampler:
         assert self._process is not None
         while not self._stop.wait(0.010):
             try:
-                self.peak_rss = max(self.peak_rss, int(self._process.memory_info().rss))
+                self.peak_rss = max(self.peak_rss, self._rss_now())
             except Exception:
                 return
 
     def finish(self) -> Tuple[float, Optional[float], Optional[float], Optional[float]]:
         elapsed_s = max(0.0, (time.perf_counter_ns() - self.wall_start_ns) / 1e9)
-        cpu_s = max(0.0, time.process_time() - self.cpu_start)
+        cpu_s = max(0.0, self._cpu_now() - self.cpu_start)
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=0.1)
         if self._process is not None:
             try:
-                self.peak_rss = max(self.peak_rss, int(self._process.memory_info().rss))
+                self.peak_rss = max(self.peak_rss, self._rss_now())
             except Exception:
                 pass
         # psutil sampling provides a per-operation peak. The Windows API value
@@ -667,8 +708,7 @@ def hash_file(
 ) -> HashResult:
     """Hash one stable file, validating size before and after the operation."""
     file_path = Path(path)
-    before = file_path.stat()
-    size_bytes = int(before.st_size)
+    size_bytes = int(file_path.stat().st_size)
     if expected_size is not None and size_bytes != int(expected_size):
         raise ValueError(
             "size mismatch before hashing: expected %d, found %d"
@@ -677,11 +717,38 @@ def hash_file(
     policy = select_policy(
         size_bytes, threads=threads, allow_mmap=allow_mmap, workload=workload
     )
+    return _hash_file_with_policy(
+        file_path, policy, collect_metrics=collect_metrics,
+    )
+
+
+def _hash_file_with_policy(
+    file_path: Path,
+    policy: HashPolicy,
+    *,
+    collect_metrics: bool = True,
+    hasher_factory: Optional[Any] = None,
+    algorithm: str = "BLAKE3",
+    profile: str = "optimized",
+    backend: str = "blake3 native extension",
+    backend_version: Optional[str] = None,
+    simd_tier: Optional[str] = None,
+) -> HashResult:
+    """Hash ``file_path`` exactly as ``policy`` dictates (no hidden tuning)."""
+    before = file_path.stat()
+    size_bytes = int(before.st_size)
     sampler = _MetricSampler(collect_metrics)
     actual = 0
+    labels = dict(
+        algorithm=algorithm, profile=profile, backend=backend,
+        backend_version=backend_version, simd_tier=simd_tier,
+    )
     try:
         with sampler:
-            hasher = _native_hasher(policy.max_threads)
+            hasher = (
+                hasher_factory() if hasher_factory is not None
+                else _native_hasher(policy.max_threads)
+            )
             with file_path.open("rb", buffering=0) as source:
                 if policy.use_mmap and size_bytes:
                     with mmap.mmap(source.fileno(), length=0, access=mmap.ACCESS_READ) as mapped:
@@ -711,6 +778,7 @@ def hash_file(
                 policy=policy,
                 metrics=metrics,
                 error="short read: expected %d bytes, received %d" % (size_bytes, actual),
+                **labels,
             )
         if identity_changed:
             return _result(
@@ -719,12 +787,14 @@ def hash_file(
                 policy=policy,
                 metrics=metrics,
                 error="file metadata changed while hashing; digest rejected",
+                **labels,
             )
         return _result(
             digest=digest,
             bytes_read=actual,
             policy=policy,
             metrics=metrics,
+            **labels,
         )
     except Exception as exc:
         # finish() is safe even if the failure happened inside the mapping/read.
@@ -735,7 +805,229 @@ def hash_file(
             policy=policy,
             metrics=metrics,
             error=str(exc),
+            **labels,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Technique configurations (Panel recommendation #2: isolate each technique)
+# ─────────────────────────────────────────────────────────────────────────────
+
+FIXED_BUFFER_BYTES = 1 * MIB
+
+
+@dataclass(frozen=True)
+class TechniqueConfig:
+    """One cell of the large-file factorial design.
+
+    ``adaptive_buffer``: size-dependent I/O buffer (adaptive_chunk_size) instead
+    of the fixed 1 MiB buffer.
+    ``multithreading``: native BLAKE3 tree parallelism on files at or above
+    SMALL_FILE_LIMIT (smaller files stay single-threaded by design).
+    ``use_mmap``: memory-mapped input. Not one of the study's claimed techniques;
+    offered only as an exploratory configuration.
+    """
+
+    key: str
+    label: str
+    adaptive_buffer: bool
+    multithreading: bool
+    use_mmap: bool = False
+    exploratory: bool = False
+
+
+BLAKE3_CONFIGS: Tuple[TechniqueConfig, ...] = (
+    TechniqueConfig("baseline", "Baseline BLAKE3", False, False),
+    TechniqueConfig("buffer_only", "Adaptive buffer only", True, False),
+    TechniqueConfig("threads_only", "Multithreading only", False, True),
+    TechniqueConfig("optimized", "Optimized (buffer + threads)", True, True),
+)
+EXPLORATORY_CONFIGS: Tuple[TechniqueConfig, ...] = (
+    TechniqueConfig("optimized_mmap", "Optimized + mmap (exploratory)", True, True,
+                    use_mmap=True, exploratory=True),
+)
+REFERENCE_ALGORITHMS: Tuple[Tuple[str, str], ...] = (
+    ("sha256", "SHA-256 (reference)"),
+    ("sha1", "SHA-1 (reference)"),
+    ("md5", "MD5 (reference)"),
+)
+CONFIGS_BY_KEY: Dict[str, TechniqueConfig] = {
+    config.key: config for config in BLAKE3_CONFIGS + EXPLORATORY_CONFIGS
+}
+
+
+def policy_for_config(
+    config: TechniqueConfig, size_bytes: int, *, threads: Optional[int] = None
+) -> HashPolicy:
+    """Translate the factor levels of ``config`` into a concrete policy."""
+    chunk = adaptive_chunk_size(size_bytes) if config.adaptive_buffer else FIXED_BUFFER_BYTES
+    if config.multithreading and size_bytes >= SMALL_FILE_LIMIT:
+        max_threads = max(1, int(threads) if threads else physical_cpu_count())
+    else:
+        max_threads = 1
+    use_mmap = bool(config.use_mmap and size_bytes >= MMAP_MIN_BYTES)
+    parts = [
+        "adaptive-buffer" if config.adaptive_buffer else "fixed-1MiB-buffer",
+        "multithread" if max_threads > 1 else "single-thread",
+    ]
+    if use_mmap:
+        parts.append("mmap")
+    return HashPolicy(chunk, max_threads, use_mmap, "+".join(parts))
+
+
+def hash_file_config(
+    path: os.PathLike[str] | str,
+    config: TechniqueConfig | str,
+    *,
+    threads: Optional[int] = None,
+    collect_metrics: bool = True,
+) -> HashResult:
+    """Hash a file with one named factorial configuration."""
+    if isinstance(config, str):
+        config = CONFIGS_BY_KEY[config]
+    file_path = Path(path)
+    policy = policy_for_config(config, int(file_path.stat().st_size), threads=threads)
+    return _hash_file_with_policy(
+        file_path, policy, collect_metrics=collect_metrics, profile=config.key,
+        simd_tier=detected_simd_tier() + " (held constant)",
+    )
+
+
+def hash_file_reference(
+    path: os.PathLike[str] | str, algorithm: str, *, collect_metrics: bool = True
+) -> HashResult:
+    """MD5/SHA reference pass with the *same* I/O path as Baseline BLAKE3.
+
+    Fixed 1 MiB streaming reads, one thread, Python ``hashlib``. Results describe
+    these algorithms *as configured here*, not their best achievable speed
+    (Panel recommendation #13).
+    """
+    algorithm = algorithm.lower()
+    if algorithm not in ("md5", "sha1", "sha256"):
+        raise ValueError("unsupported reference algorithm: %s" % algorithm)
+    policy = HashPolicy(FIXED_BUFFER_BYTES, 1, False, "fixed-1MiB-buffer+single-thread")
+    return _hash_file_with_policy(
+        Path(path), policy, collect_metrics=collect_metrics,
+        hasher_factory=lambda: hashlib.new(algorithm),
+        algorithm={"md5": "MD5", "sha1": "SHA-1", "sha256": "SHA-256"}[algorithm],
+        profile=algorithm,
+        backend="Python hashlib (OpenSSL)",
+        backend_version=platform.python_version(),
+        simd_tier="backend managed",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Small-file workloads: batched processing (Panel recommendation #2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_BATCH_SIZE = 32
+
+
+@dataclass(frozen=True)
+class SmallFileMode:
+    """One cell of the small-file factorial design (parallel × batched)."""
+
+    key: str
+    label: str
+    parallel: bool
+    batched: bool
+
+
+SMALL_FILE_MODES: Tuple[SmallFileMode, ...] = (
+    SmallFileMode("sequential", "Sequential per-file (baseline)", False, False),
+    SmallFileMode("sequential_batched", "Batched only (single process)", False, True),
+    SmallFileMode("parallel", "Parallel per-file dispatch only", True, False),
+    SmallFileMode("parallel_batched", "Optimized (parallel + batched)", True, True),
+)
+SMALL_MODES_BY_KEY: Dict[str, SmallFileMode] = {mode.key: mode for mode in SMALL_FILE_MODES}
+
+
+def _hash_small_file(path: str, buffer: Optional[bytearray] = None) -> Tuple[str, int]:
+    """Hash one small file single-threaded; returns (hex digest, bytes read).
+
+    Unbatched callers pass ``buffer=None`` so each file pays its own buffer
+    allocation and hasher set-up, exactly as an independent per-file job would.
+    """
+    hasher = _native_hasher(1)
+    if buffer is None:
+        size = os.path.getsize(path)
+        buffer = bytearray(adaptive_chunk_size(size))
+    view = memoryview(buffer)
+    total = 0
+    try:
+        with open(path, "rb", buffering=0) as source:
+            while True:
+                count = source.readinto(view)
+                if not count:
+                    break
+                hasher.update(view[:count])
+                total += count
+    finally:
+        view.release()
+    return hasher.hexdigest(), total
+
+
+def _small_file_worker(path: str) -> Tuple[str, int]:
+    return _hash_small_file(path)
+
+
+def _small_batch_worker(paths: Sequence[str]) -> List[Tuple[str, int]]:
+    # One reusable buffer and one task round-trip for the whole batch.
+    buffer = bytearray(adaptive_chunk_size(SMALL_FILE_LIMIT - 1))
+    return [_hash_small_file(path, buffer) for path in paths]
+
+
+def _worker_ready() -> int:
+    return os.getpid()
+
+
+def make_worker_pool(workers: Optional[int] = None) -> Tuple[ProcessPoolExecutor, float]:
+    """Start and warm a process pool; returns (pool, start-up seconds).
+
+    Start-up is measured once and reported separately so it does not inflate
+    each parallel trial.
+    """
+    count = max(1, int(workers or physical_cpu_count()))
+    started = time.perf_counter()
+    pool = ProcessPoolExecutor(max_workers=count)
+    ready = [pool.submit(_worker_ready) for _ in range(count * 2)]
+    for future in ready:
+        future.result()
+    return pool, time.perf_counter() - started
+
+
+def chunked(items: Sequence[str], size: int) -> List[List[str]]:
+    size = max(1, int(size))
+    return [list(items[i:i + size]) for i in range(0, len(items), size)]
+
+
+def hash_small_files(
+    paths: Sequence[str],
+    mode: SmallFileMode | str,
+    *,
+    pool: Optional[ProcessPoolExecutor] = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> List[Tuple[str, int]]:
+    """Hash a small-file workload in one factorial mode, preserving order."""
+    if isinstance(mode, str):
+        mode = SMALL_MODES_BY_KEY[mode]
+    items = [str(path) for path in paths]
+    if mode.parallel:
+        if pool is None:
+            raise ValueError("parallel modes require a worker pool")
+        if mode.batched:
+            results: List[Tuple[str, int]] = []
+            for batch_result in pool.map(_small_batch_worker, chunked(items, batch_size)):
+                results.extend(batch_result)
+            return results
+        return list(pool.map(_small_file_worker, items))
+    if mode.batched:
+        results = []
+        for batch in chunked(items, batch_size):
+            results.extend(_small_batch_worker(batch))
+        return results
+    return [_small_file_worker(path) for path in items]
 
 
 def _hash_file_worker(arguments: Tuple[str, bool, bool]) -> Dict[str, Any]:

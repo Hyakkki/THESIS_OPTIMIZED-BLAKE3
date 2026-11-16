@@ -1,158 +1,113 @@
 # Optimized BLAKE3 — Forensic Hashing Toolkit
 
-> **Thesis:** *"Performance Optimization of BLAKE3 for Multi-Format File Hashing in Digital Forensic Investigations"*
+> **Thesis:** *Performance Optimization of BLAKE3 for Multi-Format File Hashing in Digital Forensic Investigations*
 
-A toolkit that benchmarks and deploys an **optimized BLAKE3** hashing engine for digital forensic evidence processing, integrating directly with **Autopsy** via a Jython ingest module.
+A standalone desktop application and set of command-line tools. They measure the effect of
+implementation-level optimizations on BLAKE3 hashing of forensic evidence files, one technique
+at a time and in combination, with a defined statistical procedure.
 
----
+## What is optimized, and what is not
 
-## How It Works
+The **BLAKE3 algorithm is not modified.** Every digest is standard BLAKE3-256, which is confirmed
+against the official test vectors and an independent reference implementation. The study
+optimizes how files are fed to BLAKE3:
 
-The BLAKE3 algorithm itself is unchanged. Optimization is applied at the **caller level**:
-
-| Layer | What we optimize |
-|---|---|
-| **I/O strategy** | Adaptive chunk sizing, `readinto` + `memoryview`, memory-mapped I/O for large files |
-| **Parallelism** | Multithreaded file processing with `ProcessPoolExecutor` |
-| **SIMD** | Leverages the official `blake3` Rust/C library (SSE2 / SSE4.1 / AVX2 / AVX-512 auto-detected) |
-| **Autopsy bridge** | Persistent sidecar exe — starts once per session, not once per file |
-
----
-
-## Architecture
-
-```
-Autopsy (Jython 2.7)
-  └── OptimizedBLAKE3Ingest.py
-        ├── Reads file bytes via Content.read() / AbstractFile.read()
-        ├── Writes size header then raw bytes over Java OutputStream
-        └── Streams bytes ──► optimized_blake3_hasher.exe (server mode)
-                                      └── blake3_engine.py
-                                            └── blake3 (Rust/C, AVX-512)
-                                      ◄── JSON result over stdout
-```
-
-The exe runs as a **persistent server** for the entire ingest session, eliminating the ~100–300 ms startup cost per file that a single-shot approach would incur.
-
-**Server protocol (bytes-streaming):**
-
-| Step | Direction | Content |
+| Technique | What it does | Where it is measured |
 |---|---|---|
-| 1 | Client → Server | `<file_size>\n` (ASCII text line) |
-| 2 | Client → Server | `<file_size>` raw bytes (binary, no delimiter) |
-| 3 | Server → Client | `<json_result>\n` (text line) |
+| Adaptive input-buffer sizing | Read buffer from 64 KiB up to 16 MiB, chosen by file size, instead of a fixed 1 MiB | Technique Benchmark (2×2 design) |
+| Multithreaded processing of large files | BLAKE3 native tree parallelism on all physical cores for files ≥ 32 MiB | Technique Benchmark (2×2 design) |
+| Batched processing of small files | Groups of small files share one worker task and one reusable buffer | Small-File Batching (2×2 design) |
 
-This avoids writing temp files to disk, eliminating antivirus scan overhead and extra filesystem I/O.
+**Held constant (not a contribution):** native SIMD dispatch (identical in baseline and optimized
+runs), and the MD5/SHA reference passes, which use the same 1 MiB single-thread I/O path as
+Baseline BLAKE3 and are reported "as configured". Memory-mapped I/O is available only as an
+exploratory configuration.
 
----
-
-## Project Structure
+## Architecture (four layers)
 
 ```
-├── blake3_engine.py                    # Core engine: hashing, benchmarking, SIMD detection
-├── autopsy_hasher.py                   # CLI wrapper (single-file mode + server mode)
-├── benchmark.py                        # CLI benchmark runner for thesis data
-├── main_app.py                         # Tkinter UI: hash files and run benchmarks
-├── optimized_blake3_hasher.spec        # PyInstaller spec to rebuild the exe
-├── requirements.txt
-├── README.md
-│
-├── autopsy_plugin/
-│   └── BLAKE3_Autopsy_Module/
-│       ├── OptimizedBLAKE3Ingest.py   # Autopsy ingest module (Jython 2.7)
-│       ├── optimized_blake3_hasher.exe # Packaged hashing engine (server mode)
-│       └── README.md
-│
-├── artifacts/                          # Benchmark CSV outputs
-└── digital_evidence_dataset/           # Place test evidence files here
+1 Presentation          main_app.py                     Tkinter UI, progress, tables, charts, export
+2 Experiment control    dev/benchmark_blake3.py         randomized block experiments, correctness gate
+                        dev/blake3_validation.py        verification procedures V1–V6
+                        dev/dataset_tool.py             dataset generation, manifest, coverage
+3 Measurement & stats   dev/metrics.py                  formulas F1–F19, Wilcoxon, bootstrap, Cliff's δ, Holm
+4 Hashing engine        dev/optimized_blake3.py         policies, configurations, batching, process pool
+                        └─ blake3 (native Rust/C extension, runtime SIMD dispatch)
+Support                 dev/blake3_reference.py         independent pure-Python BLAKE3 (verification only)
+                        dev/test_vectors/               official BLAKE3 test vectors
 ```
-
----
 
 ## Setup
 
+Python 3.10 or newer, with Tkinter (included in the standard Windows installer).
+
 ```bash
 pip install -r requirements.txt
-```
-
-Or install manually:
-
-```bash
-pip install blake3 psutil py-cpuinfo
-```
-
-Requires Python 3.12+ with `tkinter` (included in the standard Windows Python installer).
-
----
-
-## Autopsy Plugin Installation
-
-1. Open Autopsy → **Tools → Python Plugins** to find the `python_modules` folder
-2. Copy the entire `autopsy_plugin/BLAKE3_Autopsy_Module/` folder there
-3. Restart Autopsy
-4. Open or create a case → **Run Ingest** → enable **"Optimized BLAKE3 Hasher"**
-5. After ingest completes, go to **Results → Extracted Content → BLAKE3 Hash (Optimized)** in the tree
-
-> **Note:** The plugin starts `optimized_blake3_hasher.exe` once per ingest session in server mode. Do not move or rename the exe — it must be in the same folder as `OptimizedBLAKE3Ingest.py`.
-
-An **HTML report** is automatically generated when the ingest job finishes and registered under the **Reports** node in the Autopsy tree. A pop-up dialog will also appear with the report path and an **Open Report** button.
-
----
-
-## Standalone Usage
-
-**Hash files + run benchmarks (UI):**
-```bash
 python main_app.py
 ```
 
-The File Analysis tab reports a RAM-only median for BLAKE3 performance: file
-loading is completed before timing, two warm-up hashes are excluded, and seven
-measured hashes are summarized. Files that fit the RAM budget use a complete
-snapshot. Larger evidence files still receive an authoritative full-file
-digest, while performance is measured on a clearly labelled in-memory prefix.
-The default RAM budget is the smaller of 512 MiB or one quarter of currently
-available memory. It can be overridden in bytes with
-`BLAKE3_MEMORY_BENCHMARK_LIMIT`.
+## The application
 
-**Command-line benchmark (generates CSV for thesis):**
-```bash
-python benchmark.py digital_evidence_dataset/
-python benchmark.py digital_evidence_dataset/ --parallel --repeats 5
-python benchmark.py digital_evidence_dataset/ --parallel --workers 8
-python benchmark.py digital_evidence_dataset/ --include-blake2
-```
+| Tab | Purpose |
+|---|---|
+| Overview | Contributions, constants, architecture, suggested demonstration order |
+| File Analysis | Digest, in-memory speed, avalanche / strict avalanche criterion / bit balance / duplicate screen for one file |
+| Technique Benchmark | Large-file 2×2 experiment (adaptive buffer × multithreading) plus reference algorithms; speedup with 95 % CI, Holm-adjusted Wilcoxon p, Cliff's δ, factorial effects, chart, results per size tier |
+| Small-File Batching | Small-file 2×2 experiment (batching × parallel dispatch) on a whole file set |
+| Verification | V1 official vectors (native + reference, 3 modes, 131-byte output) · V2 cross-implementation · V3 consistency across buffers, threads, I/O paths and every configuration · V4 repeatability · V5 avalanche (z-test, χ², SAC) · V6 duplicate screen and bit balance |
+| Dataset | Generate a size sweep across every policy tier and a small-file corpus; catalogue any folder into a manifest with SHA-256, provenance, a category × size-tier coverage matrix and a list of gaps |
+| Methodology | All formulas and the statistical analysis plan; exports `methodology.md` for Chapter 3 |
 
-**Single file from command line:**
-```bash
-.\autopsy_plugin\BLAKE3_Autopsy_Module\optimized_blake3_hasher.exe <file_path>
-```
+Results (JSON, run-level CSV, summary CSV) are written to `results/`.
 
-**Server mode (used by Autopsy plugin):**
-```bash
-.\autopsy_plugin\BLAKE3_Autopsy_Module\optimized_blake3_hasher.exe --server
-```
+## Statistical procedure (summary)
 
----
+- **Design:** randomized complete block design. Each round runs every configuration once in a
+  seeded random order. 30 measured rounds by default (minimum 10) and 2 excluded warm-ups.
+- **Primary indicator:** elapsed time, summarized by the median. Throughput, normalized CPU and
+  peak RSS are secondary.
+- **Inference:** paired Wilcoxon signed-rank test with Holm–Bonferroni adjustment, paired
+  bootstrap 95 % CI of the speedup, Cliff's δ and rank-biserial effect sizes. "Significantly
+  faster" requires Holm p < 0.05 **and** the whole CI above 1.
+- **Correctness gate:** every timed execution must reproduce the expected digest, otherwise the
+  run aborts.
 
-## Digital Evidence Dataset
+The full plan and formulas are in `dev/metrics.py` and the Methodology tab.
 
-Place test files in `digital_evidence_dataset/` before benchmarking. Suggested subfolders:
-
-- `documents/` — PDF, DOCX, TXT
-- `images/` — JPG, PNG, BMP
-- `audio/` — MP3, WAV, FLAC
-- `video/` — MP4, MKV, AVI
-- `executables/` — EXE, DLL
-- `disk_images/` — ISO, IMG, DD, E01, VMDK, VHD, AFF4
-
----
-
-## Rebuilding the Exe
-
-If you modify `autopsy_hasher.py` or `blake3_engine.py`:
+## Command line
 
 ```bash
-python -m PyInstaller --clean optimized_blake3_hasher.spec
-copy dist\optimized_blake3_hasher.exe autopsy_plugin\BLAKE3_Autopsy_Module\
+cd dev
+python dataset_tool.py sweep  ../digital_evidence_dataset/generated/size_sweep --max-size-mib 1024
+python dataset_tool.py small  ../digital_evidence_dataset/generated/small_files --count 2000
+python dataset_tool.py manifest ../digital_evidence_dataset
+python blake3_validation.py [optional-file] --output verification.json
+python benchmark_blake3.py large FILE [FILE ...] --trials 30 --output ../results
+python benchmark_blake3.py small FOLDER --trials 30 --output ../results
+python -m unittest discover -s tests -v
 ```
+
+## Dataset guidance
+
+Place evidence in `digital_evidence_dataset/` (git-ignored). Include files from every category:
+documents, images, audio, video, archives, executables, and disk/forensic images (raw `.dd`/`.img`
+and E01). Cover every size tier T1–T6, and include at least 500 small files. Record where each
+file came from in `digital_evidence_dataset/sources.json`; the manifest flags undocumented
+files. Public sources of forensic images include NIST CFReDS and Digital Corpora.
+
+An E01 (or other container) is hashed as a stored file. Its digest identifies the container and
+is **not** the acquisition hash recorded inside the E01.
+
+## Scope of verification
+
+The verification procedures show that this implementation computes standard BLAKE3 correctly
+under every optimization, and that outputs behave as expected on the tested inputs. They do not
+prove collision or preimage resistance. BLAKE3's security rests on its published design and
+cryptanalysis, which this study does not modify.
+
+## Autopsy plugin (secondary)
+
+`autopsy_plugin/` contains an earlier Autopsy 4.x ingest module and its sidecar executable
+(see `dev/README.md`). It is not the focus of the current work. The committed
+`optimized_blake3_hasher.exe` predates the batch protocol and must be rebuilt with
+`dev/build_sidecar.ps1` before the plugin will run.

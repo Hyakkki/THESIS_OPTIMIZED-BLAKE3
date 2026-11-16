@@ -1,11 +1,11 @@
 # Optimized BLAKE3 — Forensic Hashing Toolkit
-# Python 3.12+ required
+# Python 3.10+ required (Tkinter included with the standard Windows installer)
 
-# Core hashing engine (Rust/C backend with SSE2, AVX2, AVX-512 SIMD)
+# Core hashing engine (official Rust/C backend with runtime SIMD dispatch)
 blake3>=1.0.0
 
-# Process/resource monitoring (CPU %, memory RSS)
+# Process-tree CPU time and memory (RSS) measurement
 psutil>=5.9.0
 
-# CPU feature detection (SIMD tier reporting)
+# Optional: richer SIMD capability reporting (Windows API fallback is built in)
 py-cpuinfo>=9.0.0
