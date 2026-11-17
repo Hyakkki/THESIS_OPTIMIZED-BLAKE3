@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verification procedures for the optimized BLAKE3 implementation (Panel #5).
+"""Verification procedures for the optimized BLAKE3 implementation.
 
 Procedures
 ----------
@@ -44,11 +44,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import blake3
 
-import metrics
-from blake3_reference import reference_derive_key, reference_hash, reference_keyed_hash
+from benchmark_blake3 import binomial_bins, chi_square_sf
 from optimized_blake3 import (
     BLAKE3_CONFIGS,
-    EXPLORATORY_CONFIGS,
     MIB,
     SMALL_FILE_LIMIT,
     _small_batch_worker,
@@ -65,6 +63,8 @@ VECTOR_PATH = Path(__file__).resolve().parent / "test_vectors" / "test_vectors.j
 VECTOR_SOURCE = ("https://github.com/BLAKE3-team/BLAKE3/blob/master/"
                  "test_vectors/test_vectors.json")
 Z_CRITICAL = 3.29  # two-sided p = 0.001
+CONSISTENCY_MAX_FILE_BYTES = 1024 * MIB
+CONSISTENCY_SAMPLE_BYTES = 512 * MIB
 
 LIMITATIONS = (
     "These procedures verify that this implementation computes standard BLAKE3 "
@@ -75,6 +75,246 @@ LIMITATIONS = (
 )
 
 ProgressCallback = Optional[Callable[[str, float], None]]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Independent pure-Python BLAKE3 reference implementation
+# ─────────────────────────────────────────────────────────────────────────────
+# Independent pure-Python BLAKE3 reference implementation.
+#
+# This is a direct, line-by-line port of the BLAKE3 team's specification
+# reference implementation (``reference_impl/reference_impl.rs`` in
+# https://github.com/BLAKE3-team/BLAKE3).  It shares *no code* with the native
+# ``blake3`` package used by the optimized engine, so agreement between the two
+# is evidence of implementation correctness, not just
+# self-consistency.
+#
+# It is intentionally simple and slow (roughly 1 MiB/s): it is used only for
+# verification, never for evidence hashing or benchmarking.
+
+OUT_LEN = 32
+KEY_LEN = 32
+BLOCK_LEN = 64
+CHUNK_LEN = 1024
+
+CHUNK_START = 1 << 0
+CHUNK_END = 1 << 1
+PARENT = 1 << 2
+ROOT = 1 << 3
+KEYED_HASH = 1 << 4
+DERIVE_KEY_CONTEXT = 1 << 5
+DERIVE_KEY_MATERIAL = 1 << 6
+
+IV = (
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+    0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+)
+MSG_PERMUTATION = (2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+MASK = 0xFFFFFFFF
+
+
+def _rotr(value: int, amount: int) -> int:
+    return ((value >> amount) | (value << (32 - amount))) & MASK
+
+
+def _g(state: List[int], a: int, b: int, c: int, d: int, mx: int, my: int) -> None:
+    state[a] = (state[a] + state[b] + mx) & MASK
+    state[d] = _rotr(state[d] ^ state[a], 16)
+    state[c] = (state[c] + state[d]) & MASK
+    state[b] = _rotr(state[b] ^ state[c], 12)
+    state[a] = (state[a] + state[b] + my) & MASK
+    state[d] = _rotr(state[d] ^ state[a], 8)
+    state[c] = (state[c] + state[d]) & MASK
+    state[b] = _rotr(state[b] ^ state[c], 7)
+
+
+def _round(state: List[int], m: List[int]) -> None:
+    # Mix the columns.
+    _g(state, 0, 4, 8, 12, m[0], m[1])
+    _g(state, 1, 5, 9, 13, m[2], m[3])
+    _g(state, 2, 6, 10, 14, m[4], m[5])
+    _g(state, 3, 7, 11, 15, m[6], m[7])
+    # Mix the diagonals.
+    _g(state, 0, 5, 10, 15, m[8], m[9])
+    _g(state, 1, 6, 11, 12, m[10], m[11])
+    _g(state, 2, 7, 8, 13, m[12], m[13])
+    _g(state, 3, 4, 9, 14, m[14], m[15])
+
+
+def _permute(m: List[int]) -> List[int]:
+    return [m[MSG_PERMUTATION[i]] for i in range(16)]
+
+
+def _compress(
+    chaining_value: List[int],
+    block_words: List[int],
+    counter: int,
+    block_len: int,
+    flags: int,
+) -> List[int]:
+    state = [
+        *chaining_value[:8],
+        IV[0], IV[1], IV[2], IV[3],
+        counter & MASK, (counter >> 32) & MASK, block_len, flags,
+    ]
+    block = list(block_words)
+    for round_index in range(7):
+        _round(state, block)
+        if round_index < 6:
+            block = _permute(block)
+    for i in range(8):
+        state[i] ^= state[i + 8]
+        state[i + 8] ^= chaining_value[i]
+    return state
+
+
+def _words_from_le_bytes(data: bytes) -> List[int]:
+    return [int.from_bytes(data[i:i + 4], "little") for i in range(0, len(data), 4)]
+
+
+class _Output:
+    def __init__(self, input_cv, block_words, counter, block_len, flags):
+        self.input_chaining_value = input_cv
+        self.block_words = block_words
+        self.counter = counter
+        self.block_len = block_len
+        self.flags = flags
+
+    def chaining_value(self) -> List[int]:
+        return _compress(
+            self.input_chaining_value, self.block_words,
+            self.counter, self.block_len, self.flags,
+        )[:8]
+
+    def root_output_bytes(self, length: int) -> bytes:
+        out = bytearray()
+        output_block_counter = 0
+        while len(out) < length:
+            words = _compress(
+                self.input_chaining_value, self.block_words,
+                output_block_counter, self.block_len, self.flags | ROOT,
+            )
+            for word in words:
+                out += word.to_bytes(4, "little")
+            output_block_counter += 1
+        return bytes(out[:length])
+
+
+class _ChunkState:
+    def __init__(self, key_words: List[int], chunk_counter: int, flags: int):
+        self.chaining_value = list(key_words)
+        self.chunk_counter = chunk_counter
+        self.block = bytearray(BLOCK_LEN)
+        self.block_len = 0
+        self.blocks_compressed = 0
+        self.flags = flags
+
+    def length(self) -> int:
+        return BLOCK_LEN * self.blocks_compressed + self.block_len
+
+    def _start_flag(self) -> int:
+        return CHUNK_START if self.blocks_compressed == 0 else 0
+
+    def update(self, data: memoryview) -> None:
+        while len(data):
+            if self.block_len == BLOCK_LEN:
+                block_words = _words_from_le_bytes(bytes(self.block))
+                self.chaining_value = _compress(
+                    self.chaining_value, block_words, self.chunk_counter,
+                    BLOCK_LEN, self.flags | self._start_flag(),
+                )[:8]
+                self.blocks_compressed += 1
+                self.block = bytearray(BLOCK_LEN)
+                self.block_len = 0
+            want = BLOCK_LEN - self.block_len
+            take = min(want, len(data))
+            self.block[self.block_len:self.block_len + take] = data[:take]
+            self.block_len += take
+            data = data[take:]
+
+    def output(self) -> _Output:
+        block_words = _words_from_le_bytes(bytes(self.block))
+        return _Output(
+            self.chaining_value, block_words, self.chunk_counter,
+            self.block_len, self.flags | self._start_flag() | CHUNK_END,
+        )
+
+
+def _parent_output(left_cv, right_cv, key_words, flags) -> _Output:
+    return _Output(key_words, list(left_cv) + list(right_cv), 0, BLOCK_LEN, PARENT | flags)
+
+
+class ReferenceHasher:
+    """Incremental BLAKE3 hasher (hash, keyed_hash, derive_key modes)."""
+
+    def __init__(self, key_words: Optional[List[int]] = None, flags: int = 0):
+        self.key_words = list(key_words) if key_words is not None else list(IV)
+        self.flags = flags
+        self.chunk_state = _ChunkState(self.key_words, 0, flags)
+        self.cv_stack: List[List[int]] = []
+
+    @classmethod
+    def new_keyed(cls, key: bytes) -> "ReferenceHasher":
+        if len(key) != KEY_LEN:
+            raise ValueError("key must be exactly 32 bytes")
+        return cls(_words_from_le_bytes(key), KEYED_HASH)
+
+    @classmethod
+    def new_derive_key(cls, context: str) -> "ReferenceHasher":
+        context_hasher = cls(list(IV), DERIVE_KEY_CONTEXT)
+        context_hasher.update(context.encode("utf-8"))
+        context_key = context_hasher.finalize(KEY_LEN)
+        return cls(_words_from_le_bytes(context_key), DERIVE_KEY_MATERIAL)
+
+    def _add_chunk_chaining_value(self, new_cv: List[int], total_chunks: int) -> None:
+        # Merge completed subtrees: one merge per trailing zero bit.
+        while total_chunks & 1 == 0:
+            new_cv = _parent_output(
+                self.cv_stack.pop(), new_cv, self.key_words, self.flags
+            ).chaining_value()
+            total_chunks >>= 1
+        self.cv_stack.append(new_cv)
+
+    def update(self, data: bytes) -> "ReferenceHasher":
+        view = memoryview(bytes(data))
+        while len(view):
+            if self.chunk_state.length() == CHUNK_LEN:
+                chunk_cv = self.chunk_state.output().chaining_value()
+                total_chunks = self.chunk_state.chunk_counter + 1
+                self._add_chunk_chaining_value(chunk_cv, total_chunks)
+                self.chunk_state = _ChunkState(self.key_words, total_chunks, self.flags)
+            want = CHUNK_LEN - self.chunk_state.length()
+            take = min(want, len(view))
+            self.chunk_state.update(view[:take])
+            view = view[take:]
+        return self
+
+    def finalize(self, length: int = OUT_LEN) -> bytes:
+        output = self.chunk_state.output()
+        parent_nodes_remaining = len(self.cv_stack)
+        while parent_nodes_remaining > 0:
+            parent_nodes_remaining -= 1
+            output = _parent_output(
+                self.cv_stack[parent_nodes_remaining],
+                output.chaining_value(),
+                self.key_words,
+                self.flags,
+            )
+        return output.root_output_bytes(length)
+
+
+def reference_hash(data: bytes, length: int = OUT_LEN) -> bytes:
+    return ReferenceHasher().update(data).finalize(length)
+
+
+def reference_keyed_hash(key: bytes, data: bytes, length: int = OUT_LEN) -> bytes:
+    return ReferenceHasher.new_keyed(key).update(data).finalize(length)
+
+
+def reference_derive_key(context: str, material: bytes, length: int = OUT_LEN) -> bytes:
+    return ReferenceHasher.new_derive_key(context).update(material).finalize(length)
+
+
 
 
 def _vector_input(length: int) -> bytes:
@@ -152,14 +392,37 @@ def configuration_consistency(
     *,
     synthetic_size: int = SMALL_FILE_LIMIT + 3 * MIB + 17,
     progress: ProgressCallback = None,
+    max_file_bytes: int = CONSISTENCY_MAX_FILE_BYTES,
 ) -> Dict[str, Any]:
-    """Hash one input every supported way and require a single digest."""
+    """Hash one input every supported way and require a single digest.
+
+    About forty full passes are needed, so a selected file larger than
+    ``max_file_bytes`` is checked on a copy of its first CONSISTENCY_SAMPLE_BYTES
+    (which still crosses the multithreading and memory-mapping thresholds).
+    """
     temporary: Optional[tempfile.TemporaryDirectory] = None
+    source_label = None
     if path is None:
         temporary = tempfile.TemporaryDirectory()
         path = Path(temporary.name) / "consistency_input.bin"
         rng = random.Random(0xC0451)
         Path(path).write_bytes(rng.randbytes(synthetic_size))
+        source_label = "synthetic %d bytes" % synthetic_size
+    elif Path(path).stat().st_size > max_file_bytes:
+        original = Path(path)
+        temporary = tempfile.TemporaryDirectory()
+        sample = Path(temporary.name) / "consistency_sample.bin"
+        with open(original, "rb") as reader, open(sample, "wb") as writer:
+            remaining = CONSISTENCY_SAMPLE_BYTES
+            while remaining:
+                block = reader.read(min(8 * MIB, remaining))
+                if not block:
+                    break
+                writer.write(block)
+                remaining -= len(block)
+        source_label = "first %d MiB of %s (sample: the full file is too large for ~40 passes)" % (
+            CONSISTENCY_SAMPLE_BYTES // MIB, original)
+        path = sample
     file_path = Path(path)
     size = file_path.stat().st_size
     try:
@@ -189,8 +452,10 @@ def configuration_consistency(
                 if progress:
                     progress("Consistency: buffer %d KiB × %d threads" % (buffer // 1024, threads),
                              done / steps)
-        for config in BLAKE3_CONFIGS + EXPLORATORY_CONFIGS:
+        for config in BLAKE3_CONFIGS:
             observe("configuration: " + config.label, hash_file_config(file_path, config).digest)
+        observe("configuration: Optimized with mapping disabled (background-read fallback)",
+                hash_file_config(file_path, "optimized", allow_mmap=False).digest)
         observe("mmap (engine default policy)", hash_file(file_path, allow_mmap=True).digest)
         if size <= 512 * MIB:
             data = file_path.read_bytes()
@@ -208,7 +473,7 @@ def configuration_consistency(
         return {
             "procedure": "V3 configuration consistency",
             "passed": not mismatches,
-            "input": "synthetic %d bytes" % size if temporary else str(file_path),
+            "input": source_label or str(file_path),
             "input_bytes": size,
             "expected_digest": expected,
             "variants_tested": len(observations),
@@ -267,11 +532,11 @@ def avalanche_analysis(
     sd = statistics.stdev(distances) if n > 1 else 0.0
     z = (mean - 128.0) / (8.0 / math.sqrt(n))
 
-    bins = metrics.binomial_bins(256, 0.5, n)
+    bins = binomial_bins(256, 0.5, n)
     observed = [sum(1 for d in distances if lo <= d <= hi) for lo, hi, _e in bins]
     chi_square = sum((o - e) ** 2 / e for o, (_lo, _hi, e) in zip(observed, bins))
     df = max(1, len(bins) - 1)
-    chi_p = metrics.chi_square_sf(chi_square, df)
+    chi_p = chi_square_sf(chi_square, df)
 
     probabilities = [count / n for count in bit_flips]
     band = Z_CRITICAL * math.sqrt(0.25 / n)

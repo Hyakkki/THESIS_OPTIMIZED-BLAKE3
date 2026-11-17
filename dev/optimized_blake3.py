@@ -6,8 +6,9 @@ the official ``blake3`` native extension.  Splitting a file, hashing each part,
 and hashing the resulting digests is *not* equivalent to BLAKE3 and is never
 done here.
 
-The public API is ``hash_file()``, ``hash_stream()``, ``hash_file_config()`` and
-``hash_small_files()``; everyday multi-file hashing lives in ``file_hashing.py``.  The
+The public API is ``hash_file()``, ``hash_stream()``, ``hash_file_config()``,
+``hash_small_files()`` and, for everyday multi-file hashing with hash lists,
+``hash_paths()`` / ``write_hash_report()`` / ``verify_hash_list()``.  The
 ``--server`` mode is a persistent length-prefixed bridge for Autopsy/Jython:
 
     <ASCII byte count>\n<exactly that many raw bytes>
@@ -18,6 +19,7 @@ One compact JSON result line is returned for each request.
 from __future__ import annotations
 
 import argparse
+import csv
 import ctypes
 import functools
 import hashlib
@@ -25,14 +27,15 @@ import json
 import mmap
 import os
 import platform
+import queue
 import statistics
 import sys
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, List, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, Sequence, Tuple
 
 try:
     import blake3 as _blake3_module
@@ -49,12 +52,30 @@ except ImportError:  # Metrics still work, with a documented RSS fallback.
 
 
 MIB = 1024 * 1024
+
+# ── Names: edit here to rename the tool or update the thesis title ─────────
+TOOL_SHORT_NAME = "Optimized BLAKE3"
+TOOL_SUBTITLE = "Forensic Toolkit"
+TOOL_NAME = TOOL_SHORT_NAME + " " + TOOL_SUBTITLE
+THESIS_TITLE = ("Performance Optimization for BLAKE3 for Multi-Format File Hashing "
+                "in Digital Forensic Investigations")
 # Below this threshold the native thread-pool startup cost outweighs any
 # benefit, so small files use a single thread.  Also controls the per-file
 # multithreading gate in select_policy() and policy_for_config().
 # Override with BLAKE3_SMALL_FILE_LIMIT (bytes) for testing.
 SMALL_FILE_LIMIT = int(os.environ.get("BLAKE3_SMALL_FILE_LIMIT", str(32 * MIB)))
-MMAP_MIN_BYTES = 64 * MIB
+# Files at or above this size are hashed from a memory map (zero-copy, whole
+# file in one update) so BLAKE3's tree parallelism can use every core.
+MMAP_MIN_BYTES = SMALL_FILE_LIMIT
+# Read size for the background-read fallback (best measured value).
+PIPELINE_CHUNK_BYTES = 4 * MIB
+# Large files are mapped in windows of this size: full multithreaded speed,
+# memory use bounded (~ one window) for files of any size, and a progress /
+# cancel point after every window. Must be a multiple of the OS allocation
+# granularity (64 KiB on Windows).
+MMAP_WINDOW_BYTES = 256 * MIB
+# auto: choose by storage type; mmap / stream: force one I/O path (testing).
+IO_MODE = os.environ.get("BLAKE3_IO_MODE", "auto").strip().lower()
 DEFAULT_MEMORY_BENCHMARK_LIMIT = int(
     os.environ.get("BLAKE3_MEMORY_BENCHMARK_LIMIT", str(512 * MIB))
 )
@@ -74,6 +95,9 @@ class HashPolicy:
     max_threads: int
     use_mmap: bool
     strategy: str
+    # Read the next chunk on a background thread while the current one is hashed
+    # (used when a file cannot be memory-mapped).
+    pipelined: bool = False
 
 
 @dataclass
@@ -280,12 +304,11 @@ def benchmark_memory(
 
 
 def adaptive_chunk_size(size_bytes: int) -> int:
-    """Choose a reusable I/O buffer; BLAKE3's internal chunk is still 1 KiB.
+    """Choose the streaming read buffer; BLAKE3's internal chunk is still 1 KiB.
 
-    Adjacent tiers differ by at most 4× to avoid pipeline starvation at tier
-    boundaries (the previous implementation had an 8× jump from 256 KiB to
-    2 MiB at the old 16 MiB threshold).  Larger buffers amortise the
-    Python→C call overhead; too-large buffers evict useful data from L3 cache.
+    Small buffers suit small files (single-threaded hashing is fastest when the
+    buffer stays in CPU cache). Large files are memory-mapped instead (see
+    MMAP_MIN_BYTES), so their effective buffer is the whole file.
     """
     if size_bytes < 512 * 1024:       # < 512 KiB  — tiny files
         return 64 * 1024
@@ -293,11 +316,10 @@ def adaptive_chunk_size(size_bytes: int) -> int:
         return 256 * 1024
     if size_bytes < SMALL_FILE_LIMIT:  # 4 MiB – SMALL_FILE_LIMIT — medium
         return 512 * 1024
-    if size_bytes < 128 * MIB:        # SMALL_FILE_LIMIT – 128 MiB — large
-        return 2 * MIB
-    if size_bytes < 1024 * MIB:       # 128 MiB – 1 GiB — very large
-        return 8 * MIB
-    return 16 * MIB                   # ≥ 1 GiB — bulk
+    # ≥ SMALL_FILE_LIMIT — large: the file is normally memory-mapped (the buffer is
+    # the whole file); this size applies to streamed input and the background-read
+    # fallback, where 4 MiB measured fastest.
+    return PIPELINE_CHUNK_BYTES
 
 
 def select_policy(
@@ -319,7 +341,7 @@ def select_policy(
         max_threads = 1
         strategy = "buffered-single-thread"
     else:
-        requested = physical_cpu_count() if threads is None else int(threads)
+        requested = logical_cpu_count() if threads is None else int(threads)
         max_threads = max(1, requested)
         if workload == "latency":
             max_threads = min(max_threads, 2)
@@ -328,7 +350,8 @@ def select_policy(
     use_mmap = bool(allow_mmap and size_bytes >= MMAP_MIN_BYTES)
     if use_mmap:
         strategy = "mmap-native-tree-parallel"
-    return HashPolicy(chunk_size, max_threads, use_mmap, strategy)
+    return HashPolicy(chunk_size, max_threads, use_mmap, strategy,
+                      pipelined=size_bytes >= MMAP_MIN_BYTES)
 
 
 def _cpu_flags() -> set[str]:
@@ -352,6 +375,139 @@ def _cpu_flags() -> set[str]:
         except Exception:
             return set()
     return set()
+
+
+@functools.lru_cache(maxsize=1)
+def cpu_model() -> str:
+    """Human-readable processor name (for reports and the app's system summary)."""
+    if os.name == "nt":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+                return " ".join(str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).split())
+        except Exception:
+            pass
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as info:
+            for line in info:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return platform.processor() or platform.machine() or "unknown processor"
+
+
+def total_memory_bytes() -> Optional[int]:
+    if _psutil is None:
+        return None
+    try:
+        return int(_psutil.virtual_memory().total)
+    except Exception:
+        return None
+
+
+def available_memory_bytes() -> Optional[int]:
+    if _psutil is None:
+        return None
+    try:
+        return int(_psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def system_summary() -> Dict[str, Any]:
+    """The hardware facts the adaptive policy uses, for display and reports."""
+    memory = total_memory_bytes()
+    return {
+        "cpu_model": cpu_model(),
+        "physical_cores": physical_cpu_count(),
+        "logical_threads": logical_cpu_count(),
+        "memory_gib": round(memory / 1024 ** 3, 1) if memory else None,
+        "simd_tier": detected_simd_tier(),
+        "blake3_package_version": str(getattr(_blake3_module, "__version__", "unknown")),
+    }
+
+
+@functools.lru_cache(maxsize=64)
+def _volume_profile(root: str) -> Dict[str, Any]:
+    """Drive facts for one volume root (cached; ~2 ms per new volume)."""
+    profile: Dict[str, Any] = {"root": root, "drive_type": "unknown", "seek_penalty": None}
+    if os.name == "nt":
+        try:
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            profile["drive_type"] = {2: "removable", 3: "fixed", 4: "network", 5: "optical",
+                                     6: "ramdisk"}.get(kernel32.GetDriveTypeW(root), "unknown")
+            if profile["drive_type"] in ("fixed", "removable"):
+                name = ctypes.create_unicode_buffer(260)
+                if kernel32.GetVolumeNameForVolumeMountPointW(root, name, 260):
+                    device = name.value.rstrip("\\").replace("\\\\?\\", "\\\\.\\")
+                else:
+                    device = "\\\\.\\" + root.rstrip("\\")
+                create = kernel32.CreateFileW
+                create.restype = wintypes.HANDLE
+                handle = create(device, 0, 3, None, 3, 0, None)
+                if handle not in (None, wintypes.HANDLE(-1).value):
+                    class _Query(ctypes.Structure):
+                        _fields_ = [("PropertyId", ctypes.c_int), ("QueryType", ctypes.c_int),
+                                    ("AdditionalParameters", ctypes.c_ubyte * 1)]
+
+                    class _SeekPenalty(ctypes.Structure):
+                        _fields_ = [("Version", wintypes.DWORD), ("Size", wintypes.DWORD),
+                                    ("IncursSeekPenalty", ctypes.c_ubyte)]
+
+                    query, answer, returned = _Query(7, 0), _SeekPenalty(), wintypes.DWORD()
+                    # IOCTL_STORAGE_QUERY_PROPERTY / StorageDeviceSeekPenaltyProperty
+                    if kernel32.DeviceIoControl(handle, 0x2D1400, ctypes.byref(query),
+                                                ctypes.sizeof(query), ctypes.byref(answer),
+                                                ctypes.sizeof(answer), ctypes.byref(returned), None):
+                        profile["seek_penalty"] = bool(answer.IncursSeekPenalty)
+                    kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+    return profile
+
+
+def storage_profile(path: os.PathLike[str] | str) -> Dict[str, Any]:
+    """Classify the storage holding ``path``: ssd, hdd, network or unknown.
+
+    Spinning disks (seek penalty) and network shares favour sequential reads;
+    SSD/NVMe storage favours parallel memory-mapped reads.
+    """
+    absolute = os.path.abspath(str(path))
+    root = os.path.splitdrive(absolute)[0] + os.sep
+    if os.name == "nt":
+        try:
+            buffer = ctypes.create_unicode_buffer(260)
+            if ctypes.WinDLL("kernel32").GetVolumePathNameW(absolute, buffer, 260):
+                root = buffer.value
+        except Exception:
+            pass
+    profile = dict(_volume_profile(root))
+    if absolute.startswith("\\\\") or profile["drive_type"] == "network":
+        kind = "network"
+    elif profile["seek_penalty"] is True:
+        kind = "hdd"
+    elif profile["seek_penalty"] is False:
+        kind = "ssd"
+    else:
+        kind = "unknown"
+    profile["kind"] = kind
+    profile["sequential_preferred"] = kind in ("hdd", "network")
+    return profile
+
+
+def prefers_sequential_io(path: os.PathLike[str] | str) -> bool:
+    """True when large files on ``path`` should be streamed rather than mapped."""
+    if IO_MODE == "stream":
+        return True
+    if IO_MODE == "mmap":
+        return False
+    try:
+        return bool(storage_profile(path)["sequential_preferred"])
+    except Exception:
+        return False
 
 
 @functools.lru_cache(maxsize=1)
@@ -559,14 +715,113 @@ def _result(
     )
 
 
+def _pipelined_update(
+    hasher: Any, stream: BinaryIO, size_bytes: int, chunk_size: int, depth: int = 2,
+    progress: ByteProgress = None, cancel: Optional[threading.Event] = None,
+) -> int:
+    """Hash ``size_bytes`` from ``stream`` while a background thread reads ahead.
+
+    Reading and hashing overlap: while BLAKE3 hashes one buffer (releasing the
+    GIL), the reader thread fills the next. Returns the number of bytes hashed
+    (smaller than ``size_bytes`` on a short read, which callers reject).
+    """
+    free: "queue.Queue[Optional[bytearray]]" = queue.Queue()
+    full: "queue.Queue[Tuple[Any, int]]" = queue.Queue()
+    for _ in range(depth + 1):
+        free.put(bytearray(max(1, chunk_size)))
+    stop = threading.Event()
+
+    def reader() -> None:
+        remaining = size_bytes
+        try:
+            while remaining > 0 and not stop.is_set():
+                buffer = free.get()
+                if buffer is None:
+                    return
+                count = stream.readinto(memoryview(buffer)[:min(len(buffer), remaining)])
+                if not count:
+                    full.put((buffer, 0))
+                    return
+                remaining -= count
+                full.put((buffer, count))
+            full.put((None, 0))
+        except BaseException as exc:  # handed to the hashing thread
+            full.put((exc, 0))
+
+    worker = threading.Thread(target=reader, daemon=True)
+    worker.start()
+    total = 0
+    try:
+        while True:
+            item, count = full.get()
+            if isinstance(item, BaseException):
+                raise item
+            if item is None or not count:
+                break
+            _check_cancelled(cancel)
+            hasher.update(memoryview(item)[:count])
+            total += count
+            free.put(item)
+            if progress is not None:
+                progress(total)
+    finally:
+        stop.set()
+        free.put(None)
+        worker.join(timeout=5)
+    return total
+
+
+ByteProgress = Optional[Callable[[int], None]]
+
+
+def _check_cancelled(cancel: Optional[threading.Event]) -> None:
+    if cancel is not None and cancel.is_set():
+        raise OperationCancelled("hashing cancelled by user")
+
+
+class _MappingUnavailable(Exception):
+    """The file could not be memory-mapped at all (nothing has been hashed yet)."""
+
+
+def _mapped_update(
+    hasher: Any, source: BinaryIO, size_bytes: int, window: int = MMAP_WINDOW_BYTES,
+    progress: ByteProgress = None, cancel: Optional[threading.Event] = None,
+) -> int:
+    """Hash a file through successive memory-mapped windows.
+
+    Each window is hashed with BLAKE3's multithreaded update and then unmapped,
+    so memory stays bounded for files of any size (hundreds of GB to TB).
+    """
+    granularity = getattr(mmap, "ALLOCATIONGRANULARITY", 65536)
+    window = max(granularity, (window // granularity) * granularity)
+    offset = 0
+    while offset < size_bytes:
+        _check_cancelled(cancel)
+        length = min(window, size_bytes - offset)
+        try:
+            mapped = mmap.mmap(source.fileno(), length, access=mmap.ACCESS_READ, offset=offset)
+        except (OSError, ValueError) as exc:
+            if offset == 0:
+                raise _MappingUnavailable(str(exc))
+            raise
+        with mapped:
+            hasher.update(mapped)
+        offset += length
+        if progress is not None:
+            progress(offset)
+    return offset
+
+
 def _update_from_stream(
-    hasher: Any, stream: BinaryIO, size_bytes: int, chunk_size: int
+    hasher: Any, stream: BinaryIO, size_bytes: int, chunk_size: int,
+    progress: ByteProgress = None, cancel: Optional[threading.Event] = None,
 ) -> int:
     buffer = bytearray(max(1, chunk_size))
     view = memoryview(buffer)
     remaining = size_bytes
     total = 0
     while remaining:
+        _check_cancelled(cancel)
         requested = min(remaining, len(buffer))
         if hasattr(stream, "readinto"):
             count = stream.readinto(view[:requested])
@@ -579,6 +834,8 @@ def _update_from_stream(
         hasher.update(view[:count])
         total += int(count)
         remaining -= int(count)
+        if progress is not None:
+            progress(total)
     view.release()
     return total
 
@@ -716,6 +973,8 @@ def hash_file(
     collect_metrics: bool = True,
     expected_size: Optional[int] = None,
     workload: str = "balanced",
+    progress: ByteProgress = None,
+    cancel: Optional[threading.Event] = None,
 ) -> HashResult:
     """Hash one stable file, validating size before and after the operation."""
     file_path = Path(path)
@@ -728,8 +987,11 @@ def hash_file(
     policy = select_policy(
         size_bytes, threads=threads, allow_mmap=allow_mmap, workload=workload
     )
+    if policy.use_mmap and prefers_sequential_io(file_path):
+        policy = replace(policy, use_mmap=False,
+                         strategy="background-read-native-tree-parallel (sequential storage)")
     return _hash_file_with_policy(
-        file_path, policy, collect_metrics=collect_metrics,
+        file_path, policy, collect_metrics=collect_metrics, progress=progress, cancel=cancel,
     )
 
 
@@ -744,8 +1006,14 @@ def _hash_file_with_policy(
     backend: str = "blake3 native extension",
     backend_version: Optional[str] = None,
     simd_tier: Optional[str] = None,
+    progress: ByteProgress = None,
+    cancel: Optional[threading.Event] = None,
 ) -> HashResult:
-    """Hash ``file_path`` exactly as ``policy`` dictates (no hidden tuning)."""
+    """Hash ``file_path`` exactly as ``policy`` dictates (no hidden tuning).
+
+    ``progress(bytes_done)`` is called as the file is read; setting ``cancel``
+    raises OperationCancelled at the next window/chunk boundary.
+    """
     before = file_path.stat()
     size_bytes = int(before.st_size)
     sampler = _MetricSampler(collect_metrics)
@@ -761,13 +1029,28 @@ def _hash_file_with_policy(
                 else _native_hasher(policy.max_threads)
             )
             with file_path.open("rb", buffering=0) as source:
+                mapped_ok = False
                 if policy.use_mmap and size_bytes:
-                    with mmap.mmap(source.fileno(), length=0, access=mmap.ACCESS_READ) as mapped:
-                        hasher.update(mapped)
-                        actual = len(mapped)
+                    try:
+                        actual = _mapped_update(hasher, source, size_bytes,
+                                                progress=progress, cancel=cancel)
+                        mapped_ok = True
+                    except _MappingUnavailable as exc:
+                        # e.g. some network shares or locked files: fall back to
+                        # background-read streaming, which gives the same digest.
+                        policy = replace(
+                            policy, use_mmap=False, pipelined=True,
+                            strategy=policy.strategy.replace("mmap windows", "background-read")
+                            + " (mmap unavailable: %s)" % exc)
+                if mapped_ok:
+                    pass
+                elif policy.pipelined and size_bytes:
+                    actual = _pipelined_update(hasher, source, size_bytes, policy.chunk_size,
+                                               progress=progress, cancel=cancel)
                 else:
                     actual = _update_from_stream(
-                        hasher, source, size_bytes, policy.chunk_size
+                        hasher, source, size_bytes, policy.chunk_size,
+                        progress=progress, cancel=cancel,
                     )
             digest = hasher.hexdigest()
             metrics = sampler.finish()
@@ -807,6 +1090,8 @@ def _hash_file_with_policy(
             metrics=metrics,
             **labels,
         )
+    except OperationCancelled:
+        raise
     except Exception as exc:
         # finish() is safe even if the failure happened inside the mapping/read.
         metrics = sampler.finish() if sampler.wall_start_ns else (0.0, None, None, None)
@@ -821,7 +1106,7 @@ def _hash_file_with_policy(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Technique configurations (Panel recommendation #2: isolate each technique)
+# Technique configurations (each technique can be enabled independently)
 # ─────────────────────────────────────────────────────────────────────────────
 
 FIXED_BUFFER_BYTES = 1 * MIB
@@ -831,20 +1116,18 @@ FIXED_BUFFER_BYTES = 1 * MIB
 class TechniqueConfig:
     """One cell of the large-file factorial design.
 
-    ``adaptive_buffer``: size-dependent I/O buffer (adaptive_chunk_size) instead
-    of the fixed 1 MiB buffer.
-    ``multithreading``: native BLAKE3 tree parallelism on files at or above
-    SMALL_FILE_LIMIT (smaller files stay single-threaded by design).
-    ``use_mmap``: memory-mapped input. Not one of the study's claimed techniques;
-    offered only as an exploratory configuration.
+    ``adaptive_buffer``: the input buffer adapts to file size instead of a fixed
+    1 MiB: small buffers for small files, and for files at or above
+    MMAP_MIN_BYTES the whole file, provided zero-copy by memory mapping (with a
+    background-read fallback when a file cannot be mapped).
+    ``multithreading``: native BLAKE3 tree parallelism on all logical cores for
+    files at or above SMALL_FILE_LIMIT (smaller files stay single-threaded).
     """
 
     key: str
     label: str
     adaptive_buffer: bool
     multithreading: bool
-    use_mmap: bool = False
-    exploratory: bool = False
 
 
 BLAKE3_CONFIGS: Tuple[TechniqueConfig, ...] = (
@@ -853,37 +1136,38 @@ BLAKE3_CONFIGS: Tuple[TechniqueConfig, ...] = (
     TechniqueConfig("threads_only", "Multithreading only", False, True),
     TechniqueConfig("optimized", "Optimized (buffer + threads)", True, True),
 )
-EXPLORATORY_CONFIGS: Tuple[TechniqueConfig, ...] = (
-    TechniqueConfig("optimized_mmap", "Optimized + mmap (exploratory)", True, True,
-                    use_mmap=True, exploratory=True),
-)
 REFERENCE_ALGORITHMS: Tuple[Tuple[str, str], ...] = (
     ("sha256", "SHA-256 (reference)"),
     ("sha1", "SHA-1 (reference)"),
     ("md5", "MD5 (reference)"),
 )
 CONFIGS_BY_KEY: Dict[str, TechniqueConfig] = {
-    config.key: config for config in BLAKE3_CONFIGS + EXPLORATORY_CONFIGS
+    config.key: config for config in BLAKE3_CONFIGS
 }
 
 
 def policy_for_config(
-    config: TechniqueConfig, size_bytes: int, *, threads: Optional[int] = None
+    config: TechniqueConfig, size_bytes: int, *, threads: Optional[int] = None,
+    sequential_storage: bool = False,
 ) -> HashPolicy:
     """Translate the factor levels of ``config`` into a concrete policy."""
     chunk = adaptive_chunk_size(size_bytes) if config.adaptive_buffer else FIXED_BUFFER_BYTES
     if config.multithreading and size_bytes >= SMALL_FILE_LIMIT:
-        max_threads = max(1, int(threads) if threads else physical_cpu_count())
+        max_threads = max(1, int(threads) if threads else logical_cpu_count())
     else:
         max_threads = 1
-    use_mmap = bool(config.use_mmap and size_bytes >= MMAP_MIN_BYTES)
-    parts = [
-        "adaptive-buffer" if config.adaptive_buffer else "fixed-1MiB-buffer",
-        "multithread" if max_threads > 1 else "single-thread",
-    ]
-    if use_mmap:
-        parts.append("mmap")
-    return HashPolicy(chunk, max_threads, use_mmap, "+".join(parts))
+    large = config.adaptive_buffer and size_bytes >= MMAP_MIN_BYTES
+    use_mmap = large and not sequential_storage
+    if not config.adaptive_buffer:
+        buffer_part = "fixed-1MiB-buffer"
+    elif not large:
+        buffer_part = "adaptive-buffer"
+    elif use_mmap:
+        buffer_part = "adaptive-buffer(mmap windows)"
+    else:
+        buffer_part = "adaptive-buffer(background-read, sequential storage)"
+    parts = [buffer_part, "multithread" if max_threads > 1 else "single-thread"]
+    return HashPolicy(chunk, max_threads, use_mmap, "+".join(parts), pipelined=large)
 
 
 def hash_file_config(
@@ -892,26 +1176,37 @@ def hash_file_config(
     *,
     threads: Optional[int] = None,
     collect_metrics: bool = True,
+    allow_mmap: bool = True,
+    progress: ByteProgress = None,
+    cancel: Optional[threading.Event] = None,
 ) -> HashResult:
-    """Hash a file with one named factorial configuration."""
+    """Hash a file with one named factorial configuration.
+
+    Large files are memory-mapped on SSD/NVMe storage and streamed with
+    background reads on spinning disks or network shares (see storage_profile).
+    ``allow_mmap=False`` forces the background-read path (used to verify it).
+    """
     if isinstance(config, str):
         config = CONFIGS_BY_KEY[config]
     file_path = Path(path)
-    policy = policy_for_config(config, int(file_path.stat().st_size), threads=threads)
+    size_bytes = int(file_path.stat().st_size)
+    sequential = (not allow_mmap) or (
+        config.adaptive_buffer and size_bytes >= MMAP_MIN_BYTES and prefers_sequential_io(file_path))
+    policy = policy_for_config(config, size_bytes, threads=threads, sequential_storage=sequential)
     return _hash_file_with_policy(
         file_path, policy, collect_metrics=collect_metrics, profile=config.key,
-        simd_tier=detected_simd_tier() + " (held constant)",
+        simd_tier=detected_simd_tier() + " (held constant)", progress=progress, cancel=cancel,
     )
 
 
 def hash_file_reference(
-    path: os.PathLike[str] | str, algorithm: str, *, collect_metrics: bool = True
+    path: os.PathLike[str] | str, algorithm: str, *, collect_metrics: bool = True,
+    progress: ByteProgress = None, cancel: Optional[threading.Event] = None,
 ) -> HashResult:
     """MD5/SHA reference pass with the *same* I/O path as Baseline BLAKE3.
 
     Fixed 1 MiB streaming reads, one thread, Python ``hashlib``. Results describe
     these algorithms *as configured here*, not their best achievable speed
-    (Panel recommendation #13).
     """
     algorithm = algorithm.lower()
     if algorithm not in ("md5", "sha1", "sha256"):
@@ -925,11 +1220,12 @@ def hash_file_reference(
         backend="Python hashlib (OpenSSL)",
         backend_version=platform.python_version(),
         simd_tier="backend managed",
+        progress=progress, cancel=cancel,
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Small-file workloads: batched processing (Panel recommendation #2)
+# Small-file workloads: batched processing
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_BATCH_SIZE = 32
@@ -1190,9 +1486,463 @@ def _benchmark(paths: Sequence[str], rounds: int, threads: Optional[int]) -> Dic
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Everyday hashing: many files, hash lists (b3sum format), re-checking
+# ─────────────────────────────────────────────────────────────────────────────
+# Optimized BLAKE3 is always the main pass; Standard BLAKE3 / SHA / MD5 are
+# optional extras. Hash lists use ``<hex digest>  <path>`` lines.
+
+ProgressCallback = Optional[Callable[[str, float], None]]
+# "blake3" is always the Optimized BLAKE3 pass. The extras are optional:
+# "blake3_standard" is plain BLAKE3 without the study's optimizations (fixed
+# 1 MiB buffer, one thread, one file at a time) — same algorithm, same digest.
+EXTRA_ALGORITHMS = ("blake3_standard", "sha256", "sha1", "md5")
+ALGORITHM_LABELS = {"blake3": "Optimized BLAKE3", "blake3_standard": "Standard BLAKE3",
+                    "sha256": "SHA-256", "sha1": "SHA-1", "md5": "MD5"}
+DIGEST_LENGTHS = {"blake3": 64, "blake3_standard": 64, "sha256": 64, "sha1": 40, "md5": 32}
+LIST_EXTENSIONS = {".b3": "blake3", ".blake3": "blake3", ".sha256": "sha256",
+                   ".sha1": "sha1", ".md5": "md5"}
+# Starting worker processes costs roughly half a second, so batched parallel
+# hashing is used only when the small-file set is big enough to repay it.
+POOL_THRESHOLD = 64
+POOL_MIN_FILES = 2000
+POOL_MIN_BYTES = 256 * 1024 * 1024
+
+
+# With an already-running ("warm") pool there is no start-up cost, so batching
+# pays off from far fewer files.
+WARM_POOL_MIN_FILES = 100
+
+
+def should_use_pool(count: int, total_bytes: int, threshold: int = POOL_THRESHOLD,
+                    warm: bool = False) -> bool:
+    if warm:
+        return count >= WARM_POOL_MIN_FILES
+    return count >= threshold and (count >= POOL_MIN_FILES or total_bytes >= POOL_MIN_BYTES)
+
+
+def _small_file_task(path: str) -> Dict[str, Any]:
+    """Hash one small file; never raises (errors are returned per file)."""
+    try:
+        expected = os.path.getsize(path)
+        started = time.perf_counter()
+        hasher = _blake3_module.blake3(max_threads=1)
+        total = 0
+        with open(path, "rb", buffering=0) as source:
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                hasher.update(block)
+                total += len(block)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if total != expected:
+            return {"status": "error", "error": "short read: expected %d bytes, read %d"
+                    % (expected, total), "digest": "", "elapsed_ms": elapsed_ms}
+        return {"status": "ok", "error": "", "digest": hasher.hexdigest(), "elapsed_ms": elapsed_ms}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc), "digest": "", "elapsed_ms": None}
+
+
+def _small_batch_task(paths: Sequence[str]) -> List[Dict[str, Any]]:
+    return [_small_file_task(path) for path in paths]
+
+
+def _check_cancel(cancel: Optional[threading.Event]) -> None:
+    if cancel is not None and cancel.is_set():
+        raise OperationCancelled("hashing cancelled by user")
+
+
+def _format_rate(bytes_per_second: float) -> str:
+    value = float(bytes_per_second)
+    for unit in ("B/s", "KiB/s", "MiB/s", "GiB/s"):
+        if value < 1024 or unit == "GiB/s":
+            return "%.1f %s" % (value, unit)
+        value /= 1024
+    return "%.1f GiB/s" % value
+
+
+def _format_eta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "%d s" % seconds
+    if seconds < 3600:
+        return "%d min %02d s" % divmod(seconds, 60)
+    hours, rest = divmod(seconds, 3600)
+    return "%d h %02d min" % (hours, rest // 60)
+
+
+class _JobProgress:
+    """Byte-based progress for a hashing job: throttled, with rate and time left."""
+
+    def __init__(self, callback: ProgressCallback, total_bytes: float, interval: float = 0.1):
+        self.callback = callback
+        self.total = max(1.0, float(total_bytes))
+        self.done = 0.0
+        self.interval = interval
+        self.started = time.perf_counter()
+        self._last_emit = 0.0
+        self._message = ""
+
+    def set(self, done: float, message: Optional[str] = None, force: bool = False) -> None:
+        self.done = min(self.total, max(self.done, float(done)))
+        if message is not None:
+            self._message = message
+        if self.callback is None:
+            return
+        now = time.perf_counter()
+        if not force and now - self._last_emit < self.interval:
+            return
+        self._last_emit = now
+        elapsed = now - self.started
+        text = self._message
+        if elapsed > 1.0 and self.done > 0:
+            rate = self.done / elapsed
+            text += "  ·  %s" % _format_rate(rate)
+            remaining = (self.total - self.done) / rate if rate > 0 else 0
+            if remaining >= 1:
+                text += "  ·  about %s left" % _format_eta(remaining)
+        self.callback(text, self.done / self.total)
+
+
+def hash_paths(
+    paths: Sequence[os.PathLike[str] | str],
+    *,
+    extra_algorithms: Sequence[str] = (),
+    workers: Optional[int] = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    pool_threshold: int = POOL_THRESHOLD,
+    force_pool: Optional[bool] = None,
+    pool: Optional[ProcessPoolExecutor] = None,
+    progress: ProgressCallback = None,
+    cancel: Optional[threading.Event] = None,
+) -> Dict[str, Any]:
+    """Hash files with the optimized engine; results keep the input order.
+
+    ``pool``: an already-running worker pool (kept warm by the app) to reuse for
+    small-file batching; it is never shut down here. Without one, a temporary
+    pool is started only for very large small-file sets.
+    ``force_pool`` overrides the automatic choice (None = automatic, see
+    ``should_use_pool``).
+    """
+    extras = [a for a in extra_algorithms if a in EXTRA_ALGORITHMS]
+    items: List[str] = []
+    seen: set = set()
+    for path in paths:
+        resolved = str(Path(path).resolve())
+        if resolved not in seen:  # set lookup: fast for folders with 100k+ files
+            seen.add(resolved)
+            items.append(resolved)
+    records: Dict[str, Dict[str, Any]] = {}
+    for path in items:
+        record: Dict[str, Any] = {"path": path, "name": os.path.basename(path),
+                                  "folder": os.path.dirname(path), "status": "pending",
+                                  "error": "", "blake3": "", "elapsed_ms": None, "method": ""}
+        try:
+            record["size_bytes"] = os.path.getsize(path)
+        except OSError as exc:
+            record.update(size_bytes=0, status="error", error=str(exc))
+        records[path] = record
+
+    readable = [p for p in items if records[p]["status"] == "pending"]
+    total_bytes = sum(records[p]["size_bytes"] for p in readable)
+    compare_standard = "blake3_standard" in extras
+    # Warming the cache only helps if the data fits in memory; for data larger
+    # than available RAM (e.g. a 1 TB image) both passes read from storage anyway.
+    available = available_memory_bytes()
+    warm_cache = compare_standard and (available is None or total_bytes <= available // 2)
+    passes = 1 + len(extras) + (1 if warm_cache else 0)
+    job = _JobProgress(progress, total_bytes * passes)
+    done = [0]
+
+    def advance(byte_count: int, message: str) -> None:
+        done[0] += byte_count
+        job.set(done[0], message, force=True)
+
+    def within(name: str, label: str):
+        """Progress callback for bytes read inside one file."""
+        base = done[0]
+        return lambda current: job.set(base + current, "%s %s" % (label, name))
+
+    if warm_cache:
+        # Untimed read of every file so the Optimized and Standard passes both
+        # start from the same (warm) operating-system cache; otherwise whichever
+        # pass runs first pays the disk reads and the comparison is biased.
+        for path in readable:
+            _check_cancel(cancel)
+            try:
+                with open(path, "rb", buffering=0) as source:
+                    while source.read(8 * 1024 * 1024):
+                        _check_cancel(cancel)
+            except OSError:
+                pass
+            advance(records[path]["size_bytes"], "Preparing a fair comparison: reading %s into cache"
+                    % records[path]["name"])
+
+    small = [p for p in readable if records[p]["size_bytes"] < SMALL_FILE_LIMIT]
+    large = [p for p in readable if records[p]["size_bytes"] >= SMALL_FILE_LIMIT]
+    started = time.perf_counter()
+
+    small_bytes = sum(records[p]["size_bytes"] for p in small)
+    warm = pool is not None
+    use_pool = (should_use_pool(len(small), small_bytes, pool_threshold, warm=warm)
+                if force_pool is None else (force_pool and len(small) > 1))
+    pool_failed = False
+    if use_pool:
+        own_pool = pool is None
+        active_pool = make_worker_pool(workers)[0] if own_pool else pool
+        futures: List[Tuple[List[str], Any]] = []
+        try:
+            for batch in chunked(small, batch_size):
+                try:
+                    futures.append((batch, active_pool.submit(_small_batch_task, batch)))
+                except Exception:  # pool already broken or shut down
+                    futures.append((batch, None))
+            for batch, future in futures:
+                _check_cancel(cancel)
+                method = "batched (%d per task, %s worker processes)" % (
+                    batch_size, "warm" if warm else "new")
+                try:
+                    if future is None:
+                        raise RuntimeError("worker pool unavailable")
+                    batch_results = future.result()
+                except Exception:
+                    # A worker died or the pool is unusable: finish this batch here
+                    # so hashing still completes, and tell the caller.
+                    pool_failed = True
+                    batch_results = _small_batch_task(batch)
+                    method = "single-thread (worker pool unavailable)"
+                for path, result in zip(batch, batch_results):
+                    records[path].update(status=result["status"], error=result["error"],
+                                         blake3=result["digest"], elapsed_ms=None, method=method)
+                advance(sum(records[p]["size_bytes"] for p in batch),
+                        "Hashed batch of %d small files" % len(batch))
+        finally:
+            for _batch, future in futures:
+                if future is not None:
+                    future.cancel()
+            if own_pool:
+                active_pool.shutdown(wait=True, cancel_futures=True)
+    else:
+        for path in small:
+            _check_cancel(cancel)
+            result = _small_file_task(path)
+            records[path].update(status=result["status"], error=result["error"],
+                                 blake3=result["digest"], elapsed_ms=result["elapsed_ms"],
+                                 method="single-thread")
+            done[0] += records[path]["size_bytes"]
+            job.set(done[0], "Hashed %s" % records[path]["name"])
+
+    for path in large:
+        _check_cancel(cancel)
+        result = hash_file_config(path, "optimized", collect_metrics=False, cancel=cancel,
+                                  progress=within(records[path]["name"], "Hashing"))
+        records[path].update(
+            status=result.status, error=result.error or "", blake3=result.digest,
+            elapsed_ms=result.elapsed_ms,
+            method="%s · %d threads" % (result.io_strategy, result.threads_used))
+        advance(records[path]["size_bytes"], "Hashed %s" % records[path]["name"])
+
+    blake3_seconds = time.perf_counter() - started
+    algorithm_seconds: Dict[str, float] = {"blake3": round(blake3_seconds, 4)}
+    for algorithm in extras:
+        pass_started = time.perf_counter()
+        for path in readable:
+            _check_cancel(cancel)
+            record = records[path]
+            if record["status"] != "ok":
+                advance(record["size_bytes"], "Skipped %s" % record["name"])
+                continue
+            in_file = within(record["name"], ALGORITHM_LABELS[algorithm] + " of")
+            if algorithm == "blake3_standard":
+                result = hash_file_config(path, "baseline", collect_metrics=False,
+                                          progress=in_file, cancel=cancel)
+            else:
+                result = hash_file_reference(path, algorithm, collect_metrics=False,
+                                             progress=in_file, cancel=cancel)
+            record[algorithm] = result.digest if result.status == "ok" else ""
+            record[algorithm + "_ms"] = result.elapsed_ms
+            if result.status != "ok":
+                record.update(status="error", error="%s: %s" % (ALGORITHM_LABELS[algorithm], result.error))
+            elif algorithm == "blake3_standard":
+                # Correctness gate: optimization must never change the digest.
+                record["matches_standard"] = result.digest == record["blake3"]
+                if not record["matches_standard"]:
+                    record.update(status="error",
+                                  error="Optimized and Standard BLAKE3 digests differ")
+            advance(record["size_bytes"], "%s of %s" % (ALGORITHM_LABELS[algorithm], record["name"]))
+        algorithm_seconds[algorithm] = round(time.perf_counter() - pass_started, 4)
+
+    job.set(job.total, "Hashing complete", force=True)  # never leave the bar short
+    files = [records[p] for p in items]
+    hashed_bytes = sum(r["size_bytes"] for r in files if r["status"] == "ok")
+    standard_comparison = None
+    if "blake3_standard" in extras:
+        standard_s = algorithm_seconds["blake3_standard"]
+        compared = [r for r in files if "matches_standard" in r]
+        standard_comparison = {
+            "files_compared": len(compared),
+            "identical_digests": sum(1 for r in compared if r["matches_standard"]),
+            "optimized_seconds": round(blake3_seconds, 4),
+            "standard_seconds": standard_s,
+            "speedup": round(standard_s / blake3_seconds, 3) if blake3_seconds > 0 else None,
+            "cache_warmup": ("untimed warm-up read first; both passes start from the cache"
+                             if warm_cache else
+                             "skipped: data larger than available memory, so both passes read "
+                             "from storage"),
+            "note": "Single-pass comparison. Controlled, repeated measurements are available in "
+                    "Technique Evaluation.",
+        }
+    return {
+        "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "tool": TOOL_NAME,
+        "small_file_batching": use_pool,
+        "worker_pool_warm": warm,
+        "worker_pool_failed": pool_failed,
+        "engine": {
+            "blake3_package_version": str(getattr(_blake3_module, "__version__", "unknown")),
+            "simd_tier": detected_simd_tier(),
+            "physical_cpu_count": physical_cpu_count(),
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+        },
+        "algorithms": ["blake3"] + extras,
+        "algorithm_labels": {a: ALGORITHM_LABELS[a] for a in ["blake3"] + extras},
+        "algorithm_seconds": algorithm_seconds,
+        "standard_comparison": standard_comparison,
+        "files": files,
+        "file_count": len(files),
+        "ok_count": sum(1 for r in files if r["status"] == "ok"),
+        "error_count": sum(1 for r in files if r["status"] != "ok"),
+        "total_bytes": hashed_bytes,
+        "blake3_seconds": round(blake3_seconds, 4),
+        "blake3_throughput_mib_s": round(hashed_bytes / (1024 * 1024) / blake3_seconds, 2)
+        if blake3_seconds > 0 else 0.0,
+        "total_seconds": round(time.perf_counter() - started, 4),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hash lists (b3sum / sha256sum format)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_hash_list(report: Dict[str, Any], path: os.PathLike[str] | str,
+                    algorithm: str = "blake3") -> int:
+    """Write ``<digest>  <absolute path>`` lines; returns the number of entries."""
+    lines = [
+        "%s  %s" % (record[algorithm], record["path"])
+        for record in report["files"]
+        if record["status"] == "ok" and record.get(algorithm)
+    ]
+    Path(path).write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return len(lines)
+
+
+def write_hash_report(report: Dict[str, Any], folder: os.PathLike[str] | str, stem: str) -> Dict[str, str]:
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = {"json": str(folder / (stem + ".json")), "csv": str(folder / (stem + ".csv"))}
+    Path(paths["json"]).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    columns = ["name", "folder", "size_bytes"] + report["algorithms"] + [
+        "elapsed_ms", "method"]
+    columns += [a + "_ms" for a in report["algorithms"][1:]]
+    if "blake3_standard" in report["algorithms"]:
+        columns.append("matches_standard")
+    columns += ["status", "error", "path"]
+    with open(paths["csv"], "w", newline="", encoding="utf-8") as output:
+        writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(report["files"])
+    for algorithm in report["algorithms"]:
+        if algorithm == "blake3_standard":
+            continue  # identical digests to the Optimized list; no separate file needed
+        extension = ".b3" if algorithm == "blake3" else "." + algorithm
+        list_path = folder / (stem + extension)
+        write_hash_list(report, list_path, algorithm)
+        paths[algorithm] = str(list_path)
+    return paths
+
+
+def parse_hash_list(path: os.PathLike[str] | str) -> Dict[str, Any]:
+    list_path = Path(path)
+    algorithm = LIST_EXTENSIONS.get(list_path.suffix.lower())
+    entries = []
+    for number, raw in enumerate(list_path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            raise ValueError("line %d is not '<digest>  <path>'" % number)
+        digest, file_part = parts[0].lower(), parts[1].lstrip("*").strip()
+        try:
+            int(digest, 16)
+        except ValueError:
+            raise ValueError("line %d does not start with a hexadecimal digest" % number)
+        file_path = Path(file_part)
+        if not file_path.is_absolute():
+            file_path = list_path.parent / file_path
+        entries.append({"line": number, "expected": digest, "path": str(file_path.resolve())})
+    if not entries:
+        raise ValueError("the hash list is empty")
+    if algorithm is None:
+        length = len(entries[0]["expected"])
+        algorithm = {64: "blake3", 40: "sha1", 32: "md5"}.get(length)
+        if algorithm is None:
+            raise ValueError("cannot tell the algorithm from a %d-character digest" % length)
+    for entry in entries:
+        if len(entry["expected"]) != DIGEST_LENGTHS[algorithm]:
+            raise ValueError("line %d has the wrong digest length for %s"
+                             % (entry["line"], ALGORITHM_LABELS[algorithm]))
+    return {"algorithm": algorithm, "entries": entries}
+
+
+def verify_hash_list(
+    path: os.PathLike[str] | str,
+    *,
+    progress: ProgressCallback = None,
+    cancel: Optional[threading.Event] = None,
+    pool: Optional[ProcessPoolExecutor] = None,
+) -> Dict[str, Any]:
+    """Re-hash every file in a hash list and report matches, mismatches, missing files."""
+    parsed = parse_hash_list(path)
+    algorithm = parsed["algorithm"]
+    entries = parsed["entries"]
+    present = [e for e in entries if os.path.isfile(e["path"])]
+    if algorithm == "blake3":
+        report = hash_paths([e["path"] for e in present], progress=progress, cancel=cancel, pool=pool)
+        actual = {r["path"]: (r["blake3"], r["status"], r["error"]) for r in report["files"]}
+    else:
+        actual = {}
+        sizes = {e["path"]: os.path.getsize(e["path"]) for e in present}
+        job = _JobProgress(progress, sum(sizes.values()))
+        done = 0
+        for entry in present:
+            _check_cancel(cancel)
+            name = os.path.basename(entry["path"])
+            result = hash_file_reference(
+                entry["path"], algorithm, collect_metrics=False, cancel=cancel,
+                progress=lambda current, base=done, n=name: job.set(base + current, "Checking " + n))
+            actual[entry["path"]] = (result.digest, result.status, result.error or "")
+            done += sizes[entry["path"]]
+            job.set(done, "Checked " + name, force=True)
+    results = []
+    for entry in entries:
+        if entry["path"] not in actual:
+            outcome, digest, error = "missing", "", "file not found"
+        else:
+            digest, status, error = actual[entry["path"]]
+            outcome = ("match" if digest == entry["expected"] else "mismatch") if status == "ok" else "error"
+        results.append(dict(entry, actual=digest, outcome=outcome, error=error))
+    counts = {kind: sum(1 for r in results if r["outcome"] == kind)
+              for kind in ("match", "mismatch", "missing", "error")}
+    return {"list": str(path), "algorithm": algorithm, "results": results, "counts": counts,
+            "passed": counts["match"] == len(results)}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("paths", nargs="*", help="files to hash")
+    parser.add_argument("paths", nargs="*", help="files or folders to hash")
     parser.add_argument("--server", action="store_true", help="run Autopsy stream server")
     parser.add_argument("--threads", type=int, help="maximum native worker threads")
     parser.add_argument("--no-mmap", action="store_true", help="disable mmap for local files")
@@ -1200,6 +1950,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--self-test", action="store_true", help="run standard-vector validation")
     parser.add_argument("--benchmark", action="store_true", help="record precision metrics")
     parser.add_argument("--rounds", type=int, default=3, help="benchmark repetitions")
+    parser.add_argument("--extra", nargs="*", default=[], choices=EXTRA_ALGORITHMS,
+                        help="optional extra passes; Optimized BLAKE3 always runs")
+    parser.add_argument("--save", help="folder for a hash report and .b3 hash list")
+    parser.add_argument("--check", help="re-check files against a saved hash list")
     return parser
 
 
@@ -1207,15 +1961,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.server:
         return serve_forever(threads=args.threads)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     if args.self_test:
         report = self_test()
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report["passed"] else 2
+    if args.check:
+        checked = verify_hash_list(args.check)
+        for item in checked["results"]:
+            print("%-8s %s" % (item["outcome"].upper(), item["path"]))
+        print(json.dumps(checked["counts"]))
+        return 0 if checked["passed"] else 1
     if not args.paths:
-        raise SystemExit("provide at least one file, --server, or --self-test")
+        raise SystemExit("provide files/folders, --check LIST, --server, or --self-test")
     if args.benchmark:
         print(json.dumps(_benchmark(args.paths, max(1, args.rounds), args.threads), indent=2))
         return 0
+    if args.extra or args.save or any(os.path.isdir(p) for p in args.paths):
+        files: List[str] = []
+        for path in args.paths:
+            if os.path.isdir(path):
+                files.extend(str(p) for p in sorted(Path(path).rglob("*")) if p.is_file())
+            else:
+                files.append(path)
+        report = hash_paths(files, extra_algorithms=args.extra)
+        for record in report["files"]:
+            if record["status"] == "ok":
+                print("%s  %s" % (record["blake3"], record["path"]))
+            else:
+                print("ERROR  %s: %s" % (record["path"], record["error"]), file=sys.stderr)
+        if args.save:
+            written = write_hash_report(report, args.save, "hashes_" + time.strftime("%Y%m%d_%H%M%S"))
+            print(json.dumps(written, indent=2))
+        return 0 if report["error_count"] == 0 else 1
 
     exit_code = 0
     for path in args.paths:

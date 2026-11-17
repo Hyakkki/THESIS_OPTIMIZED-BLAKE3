@@ -1,12 +1,12 @@
 # Optimized BLAKE3 Autopsy Module
 
-> **Note (Thesis 2):** the standalone application (`main_app.py` with `metrics.py`,
-> `benchmark_blake3.py`, `blake3_validation.py`, `dataset_tool.py`, `blake3_reference.py`) is
-> now the primary deliverable; see the root `README.md`. This file documents the Autopsy plugin.
+> **Note (Thesis 2):** the standalone application (`main_app.py` with `optimized_blake3.py`,
+> `benchmark_blake3.py`, `blake3_validation.py`, `dataset_tool.py`) is now the primary
+> deliverable; see the root `README.md`. This file documents the Autopsy plugin.
 
 This directory contains a standards-compliant native BLAKE3 engine, an Autopsy
 4.x Jython bridge, a fair benchmarking harness, and cryptographic integrity
-checks for the thesis **“Performance Optimization of BLAKE3 for Multi-Format
+checks for the thesis **“Performance Optimization for BLAKE3 for Multi-Format
 File Hashing in Digital Forensic Investigations.”**
 
 ## Architecture

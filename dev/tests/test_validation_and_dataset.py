@@ -9,7 +9,7 @@ import blake3
 
 import blake3_validation as validation
 import dataset_tool
-from blake3_reference import reference_hash
+from blake3_validation import reference_hash
 from optimized_blake3 import MIB, SMALL_FILE_LIMIT
 
 
@@ -82,6 +82,41 @@ class DatasetTests(unittest.TestCase):
                 handle.write(b"tampered")
             self.assertEqual(dataset_tool.verify_manifest(json_path)["changed"],
                              ["sweep/" + sweep[0].name])
+
+
+
+class ScaleDatasetTests(unittest.TestCase):
+    def test_manifest_uses_blake3_and_accepts_old_sha256_manifests(self):
+        import hashlib
+        import json as _json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "doc.txt").write_bytes(b"evidence")
+            manifest = dataset_tool.build_manifest(root)
+            entry = manifest["files"][0]
+            self.assertEqual(entry["blake3"], blake3.blake3(b"evidence").hexdigest())
+            self.assertNotIn("sha256", entry)
+            json_path, _csv = dataset_tool.write_manifest(manifest, root)
+            self.assertTrue(dataset_tool.verify_manifest(json_path)["passed"])
+            old = _json.loads(json_path.read_text(encoding="utf-8"))
+            for item in old["files"]:
+                item.pop("blake3")
+                item["sha256"] = hashlib.sha256(b"evidence").hexdigest()
+            json_path.write_text(_json.dumps(old), encoding="utf-8")
+            self.assertTrue(dataset_tool.verify_manifest(json_path)["passed"])
+
+    def test_consistency_samples_large_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "image.dd")
+            path.write_bytes(os.urandom(300_000))
+            result = validation.configuration_consistency(path, max_file_bytes=100_000)
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["input"].startswith("first "))
+
+    def test_planned_read_volume(self):
+        import benchmark_blake3
+        self.assertEqual(benchmark_blake3.planned_read_bytes([10, 20], trials=30, warmups=2), 30 * 7 * 32)
+        self.assertEqual(benchmark_blake3.planned_read_bytes([10], 10, 0, include_references=False), 400)
 
 
 if __name__ == "__main__":

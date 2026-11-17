@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark dataset generation, classification, and manifest (Panel #4, #19).
+"""Test dataset generation, classification, and manifest.
 
 Three jobs:
 
@@ -9,7 +9,7 @@ Three jobs:
 2. ``generate_small_file_corpus`` – many small files (log-uniform sizes) for the
    batched-processing experiment.
 3. ``build_manifest`` – records size, format, category, size tier, provenance,
-   and SHA-256 of every dataset file, plus a category × size-tier coverage
+   and Optimized BLAKE3 fingerprint of every dataset file, plus a category × size-tier coverage
    matrix and a list of gaps. The manifest is the audit trail that justifies
    (and lets others reproduce) the dataset.
 
@@ -39,7 +39,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import blake3 as _blake3
 
-from optimized_blake3 import MIB, SMALL_FILE_LIMIT
+from optimized_blake3 import MIB, SMALL_FILE_LIMIT, hash_file_config
 
 KIB = 1024
 GIB = 1024 * MIB
@@ -188,6 +188,14 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _blake3_file(path: Path, progress=None, cancel=None) -> str:
+    """Optimized BLAKE3 fingerprint (memory-mapped/multithreaded for large files)."""
+    result = hash_file_config(path, "optimized", collect_metrics=False, progress=progress, cancel=cancel)
+    if result.status != "ok":
+        raise OSError("could not hash %s: %s" % (path, result.error))
+    return result.digest
+
+
 def _load_sources(root: Path) -> Dict[str, Any]:
     """Optional ``sources.json``: {"relative/path/or/folder": {"source": ..., "license": ...}}."""
     path = root / "sources.json"
@@ -221,6 +229,7 @@ def build_manifest(
     *,
     compute_hashes: bool = True,
     progress: ProgressCallback = None,
+    cancel=None,
 ) -> Dict[str, Any]:
     root_path = Path(root).resolve()
     sources = _load_sources(root_path)
@@ -241,7 +250,10 @@ def build_manifest(
         }
         entry.update({"provenance_" + k: v for k, v in _provenance(relative, sources).items()})
         if compute_hashes:
-            entry["sha256"] = _sha256_file(path)
+            in_file = (None if progress is None else
+                       (lambda current, base=done, name=relative:
+                        progress("Fingerprinting %s" % name, (base + current) / total_bytes)))
+            entry["blake3"] = _blake3_file(path, progress=in_file, cancel=cancel)
         entries.append(entry)
         done += stat.st_size
         if progress:
@@ -311,8 +323,10 @@ def verify_manifest(manifest_path: os.PathLike[str] | str) -> Dict[str, Any]:
         path = root / entry["relative_path"]
         if not path.is_file():
             missing.append(entry["relative_path"])
-        elif entry.get("sha256") and _sha256_file(path) != entry["sha256"]:
+        elif entry.get("blake3") and _blake3_file(path) != entry["blake3"]:
             changed.append(entry["relative_path"])
+        elif not entry.get("blake3") and entry.get("sha256") and _sha256_file(path) != entry["sha256"]:
+            changed.append(entry["relative_path"])  # manifests from earlier versions
     return {"passed": not changed and not missing, "changed": changed, "missing": missing,
             "checked": len(manifest["files"])}
 
